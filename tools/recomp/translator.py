@@ -48,7 +48,20 @@ def _merge_flag_states(states):
             if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
                 return None
         return first
+    # SSE compares snapshot both operands into the function-wide doubles
+    # _fca/_fcb when they run, and every one of them leaves CF/ZF the same
+    # way (_make_condition reads only the snapshot), so predecessors that
+    # compared different registers still agree on what a jcc at the join
+    # means. Left unmerged, the jcc fell back to `_flags`, which is never
+    # assigned: FP's pickup test (0x000C17D9, two comiss reaching one jbe)
+    # skipped its radius check, so every pickup level-wide was collected at
+    # load.
+    if all(kind in _SSE_COMPARES and len(ops) == 2 for kind, ops in states):
+        return first
     return _merge_zero_flag(states)
+
+
+_SSE_COMPARES = frozenset({"comiss", "comisd", "ucomiss", "ucomisd"})
 
 
 def _merge_zero_flag(states):
