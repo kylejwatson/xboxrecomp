@@ -82,6 +82,7 @@ static long    g_watch_budget = 200;
 static int     g_disarmed;
 static char    g_arm_on[128];       /* RECOMP_WATCH_ARM_ON, until it fires */
 static long    g_arm_on_nth = 1;    /* ...on the Nth matching open ("text#N") */
+static int     g_arm_on_key;        /* RECOMP_WATCH_ARM_KEY: held until F6 */
 
 /* Single-step state is per thread: two threads can be mid-step at once, and
  * each has to put back its own page. */
@@ -307,6 +308,20 @@ void xbox_watch_init(void)
      * Perfect's cutscene record at 0x813A6580 shares its page with start-up
      * work, and with the watch armed from boot the scripted presses landed on
      * different screens and the run never reached the cutscene at all. */
+    /* Armed by hand: F6 in the game window (xbox_watch_poll_key, once a
+     * frame). For a moment reached by playing, not by a file open --
+     * Future Perfect's gunner seat in the second level, where an object
+     * allocated at the level load is watched once the player is driving. */
+    {
+        const char *key = getenv("RECOMP_WATCH_ARM_KEY");
+        if (key && *key && strcmp(key, "0") != 0) {
+            g_arm_on_key = 1;
+            fprintf(stderr, "[WATCH] %d watchpoint(s) held until F6 in the game "
+                    "window\n", g_n_watch);
+            fflush(stderr);
+            return;
+        }
+    }
     {
         const char *on = getenv("RECOMP_WATCH_ARM_ON");
         if (on && *on) {
@@ -349,6 +364,27 @@ void xbox_watch_note_path(const char *xbox_path)
     fprintf(stderr, "[WATCH] armed on opening %s: %d watchpoint(s) on %s, "
             "budget %ld reports\n", xbox_path, g_n_watch,
             g_watch_reads ? "reads and writes" : "writes", g_watch_budget);
+    fflush(stderr);
+}
+
+void xbox_watch_poll_key(void)
+{
+    DWORD pid = 0;
+    int i;
+
+    if (!g_arm_on_key)
+        return;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    if (pid != GetCurrentProcessId() || !(GetAsyncKeyState(VK_F6) & 0x8000))
+        return;
+    g_arm_on_key = 0;                   /* once */
+    for (i = 0; i < g_n_watch; i++) {
+        g_watch[i].last = guest_read32(g_watch[i].va);
+        fprintf(stderr, "[WATCH] 0x%08X holds 0x%08X\n", g_watch[i].va, g_watch[i].last);
+    }
+    arm_all();
+    fprintf(stderr, "[WATCH] armed by F6: %d watchpoint(s) on %s, budget %ld reports\n",
+            g_n_watch, g_watch_reads ? "reads and writes" : "writes", g_watch_budget);
     fflush(stderr);
 }
 

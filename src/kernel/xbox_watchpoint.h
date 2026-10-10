@@ -38,8 +38,11 @@ int xbox_watch_handle_step(PEXCEPTION_POINTERS ep);
  * whose path contains <text>. Called with every translated guest path. */
 #ifdef _WIN32
 void xbox_watch_note_path(const char *xbox_path);
+/* RECOMP_WATCH_ARM_KEY: arms the watches when F6 is pressed; once a frame. */
+void xbox_watch_poll_key(void);
 #else
 #define xbox_watch_note_path(p)                 ((void)0)
+#define xbox_watch_poll_key()                   ((void)0)
 #endif
 
 void xbox_watch_scan_value(uint32_t value);

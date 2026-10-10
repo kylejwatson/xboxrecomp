@@ -30,6 +30,7 @@
 #include <string.h>
 
 #include "xbox_memory_layout.h"
+#include "xbox_watchpoint.h"
 
 static volatile LONG64 s_swaps;
 static volatile LONG64 s_vblanks;
@@ -181,6 +182,31 @@ static void wp_print(const char *name, const wait_sums *s, double ms_per_tick)
     fputc('\n', stderr);
 }
 
+/* Guest RAM to <dir>/ram_<name>.bin and the contiguous window (0x80000000,
+ * separate storage at the same guest-to-host offset) to contig_<name>.bin:
+ * Future Perfect's player object is there, and a low-RAM diff never finds it. */
+static void ram_dump_write(const char *dir, const char *name)
+{
+    extern ptrdiff_t g_xbox_mem_offset;
+    char path[512];
+    FILE *f;
+
+    snprintf(path, sizeof path, "%s/ram_%s.bin", dir, name);
+    f = fopen(path, "wb");
+    if (f) {
+        fwrite((const void *)(uintptr_t)g_xbox_mem_offset, 1, g_xbox_total_ram, f);
+        fclose(f);
+        fprintf(stderr, "[FPS]   guest RAM written to %s\n", path);
+    }
+    snprintf(path, sizeof path, "%s/contig_%s.bin", dir, name);
+    f = fopen(path, "wb");
+    if (f) {
+        fwrite((const void *)((uintptr_t)0x80000000u + g_xbox_mem_offset), 1,
+               64u * 1024u * 1024u, f);
+        fclose(f);
+    }
+}
+
 static DWORD WINAPI fps_reporter(LPVOID param)
 {
     double secs = *(double *)param;
@@ -266,25 +292,9 @@ static DWORD WINAPI fps_reporter(LPVOID param)
                 at = getenv("RECOMP_RAM_DUMP_AT");
             }
             if (dir && at && *at && elapsed >= atof(at)) {
-                char path[512];
-                FILE *f;
-                snprintf(path, sizeof path, "%s/ram_%.0f.bin", dir, elapsed);
-                f = fopen(path, "wb");
-                if (f) {
-                    fwrite((const void *)(uintptr_t)g_xbox_mem_offset, 1, g_xbox_total_ram, f);
-                    fclose(f);
-                    fprintf(stderr, "[FPS]   guest RAM written to %s\n", path);
-                }
-                /* The contiguous window (0x80000000, separate storage at the
-                 * same guest-to-host offset) too: Future Perfect's player
-                 * object is there, and a low-RAM diff never finds it. */
-                snprintf(path, sizeof path, "%s/contig_%.0f.bin", dir, elapsed);
-                f = fopen(path, "wb");
-                if (f) {
-                    fwrite((const void *)((uintptr_t)0x80000000u + g_xbox_mem_offset), 1,
-                           64u * 1024u * 1024u, f);
-                    fclose(f);
-                }
+                char name[64];
+                snprintf(name, sizeof name, "%.0f", elapsed);
+                ram_dump_write(dir, name);
                 at = strchr(at, ',');
                 at = at ? at + 1 : NULL;
             }
@@ -367,6 +377,42 @@ void xbox_FpsCountSwap(void)
     if (!s_started)
         fps_start_once();
     InterlockedIncrement64(&s_swaps);
+    xbox_watch_poll_key();
+    /* RECOMP_RAM_DUMP=<dir>: F7 (game window in front) writes the next
+     * RECOMP_RAM_DUMP_BURST (default 8) presented frames as
+     * ram_k<n>_<i>.bin / contig_k<n>_<i>.bin, for a value that flips between
+     * frames (a character teleporting) that a timed dump can't catch. The
+     * game waits while each is written, so the frames are consecutive. */
+    {
+        static const char *dir;
+        static int init, burst = 8, left, index, presses, was_down;
+        int down;
+
+        if (!init) {
+            const char *b = getenv("RECOMP_RAM_DUMP_BURST");
+            init = 1;
+            dir = getenv("RECOMP_RAM_DUMP");
+            if (b && atoi(b) > 0)
+                burst = atoi(b);
+        }
+        if (dir) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+            down = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+            if (down && !was_down && !left) {
+                presses++;
+                left = burst;
+                index = 0;
+            }
+            was_down = down;
+            if (left) {
+                char name[64];
+                snprintf(name, sizeof name, "k%d_%d", presses, index++);
+                ram_dump_write(dir, name);
+                left--;
+            }
+        }
+    }
     if (last >= 0) {
         LONG64 d = v - last;
         InterlockedIncrement(&s_span[d < 0 ? 0 : d > 4 ? 4 : (int)d]);

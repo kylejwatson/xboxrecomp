@@ -21,7 +21,7 @@ Two things have to hold, and the second is the one that bit:
 """
 
 from tools.recomp.lifter import zf_expression
-from tools.recomp.translator import _before_terminator
+from tools.recomp.translator import _before_terminator, _zf_fallback_polarity
 
 
 def test_zf_expression_per_setter():
@@ -49,3 +49,28 @@ def test_the_write_goes_before_the_block_leaves():
     # Nothing leaves: fall-through, so appending is right.
     assert _before_terminator(["eax = 1;", "ecx = 2;"]) == 2
     assert _before_terminator([]) == 0
+
+
+def test_a_clear_zero_flag_consumer_reads_it_negated():
+    """_flags holds ZF itself, so jne/setne/cmovne need its negation.
+
+    Every jne at such a join was inverted: Future Perfect's AI vehicle
+    update (`test al, 0x10; jne` at 0x002A0C4D) sent the dismount command
+    exactly when it should not have.
+    """
+    jne = "if (_flags /* jne: not equal / not zero */) goto loc_002A0C75;"
+    assert _zf_fallback_polarity(jne) == (
+        "if (!_flags /* jne: not equal / not zero */) goto loc_002A0C75;")
+    assert _zf_fallback_polarity("SET_LO8(eax, _flags /* setne */);") == (
+        "SET_LO8(eax, !_flags /* setne */);")
+    assert _zf_fallback_polarity("if (_flags /* cmovne */) eax = ecx;") == (
+        "if (!_flags /* cmovne */) eax = ecx;")
+    # je reads ZF as it is; other conditions are not ZF and stay as they were.
+    je = "if (_flags /* je: equal / zero */) goto loc_1;"
+    assert _zf_fallback_polarity(je) == je
+    jl = "if (_flags /* jl: less (signed <) */) goto loc_1;"
+    assert _zf_fallback_polarity(jl) == jl
+    # Applied twice it does not flip back.
+    once = _zf_fallback_polarity(jne)
+    assert _zf_fallback_polarity(once) == once
+

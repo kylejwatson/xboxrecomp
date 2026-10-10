@@ -150,6 +150,17 @@ recurses. `RECOMP_RAM_DUMP` also writes the contiguous window as
 `contig_<s>.bin` -- FP's player object lives there, so low RAM alone never
 showed its camera angles.
 
+**ZF joins, Oct 2026:** at a join whose predecessors set the flags differently,
+each predecessor writes ZF itself to `_flags` (`zf_expression`), but the
+consumer was emitted as the bare `if (_flags ...)` whatever its condition, so
+every `jne`/`setne`/`cmovne` there was inverted. They now read `!_flags`
+(`_zf_fallback_polarity` in `translator.py`); 6 branches in FP, one of them
+its AI vehicle update ordering a gunner out of his seat every third frame.
+Found with two new hands-on switches for moments reached by playing: with
+`RECOMP_RAM_DUMP=<dir>`, F7 writes the next `RECOMP_RAM_DUMP_BURST` (8) frames
+as `ram_k<n>_<i>.bin`/`contig_k<n>_<i>.bin` (a value flipping between frames),
+and `RECOMP_WATCH_ARM_KEY=1` holds `RECOMP_WATCH_WRITE` until F6.
+
 **Update, 22 Sep 2026 -- TimeSplitters: Future Perfect (XDK 5849) reaches its front end.**
 Five faults sat on top of each other and each needed its own measurement; the
 list, with the tool that found each, is in `docs/technical/shadow-mode.md` ("A frame

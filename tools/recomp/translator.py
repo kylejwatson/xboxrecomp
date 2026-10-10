@@ -95,6 +95,26 @@ def _merge_zero_flag(states):
     return ("__zf_from_dest", [states[0][1][0]])
 
 
+# The consumers of a ZF join that branch on a clear zero flag. The join's
+# predecessors write ZF itself to `_flags` (lifter.zf_expression), and the
+# fallback condition is the bare `_flags`, which is right for je/jz/sete/
+# cmove and the opposite for these: every jne at such a join was inverted.
+# TimeSplitters: Future Perfect's AI vehicle update (0x002A0C4D: `test al,
+# 0x10; jne`) ordered Captain Ash out of the car every third frame.
+_ZF_CLEAR_CONSUMERS = ("jne", "jnz", "setne", "setnz", "cmovne", "cmovnz")
+
+
+def _zf_fallback_polarity(stmt):
+    """`_flags /* jne...` -> `!_flags /* jne...` in a statement read at a ZF
+    join; anything else unchanged."""
+    for m in _ZF_CLEAR_CONSUMERS:
+        for form in (f"_flags /* {m}: ", f"_flags /* {m} */"):
+            j = stmt.find(form)
+            if j >= 0 and (j == 0 or stmt[j - 1] != "!"):
+                return stmt[:j] + "!" + stmt[j:]
+    return stmt
+
+
 def _before_terminator(stmts):
     """Index of the first trailing statement that leaves the block.
 
@@ -1459,6 +1479,7 @@ class FunctionTranslator:
         # its own zero flag writes one, and the fallback reads a real value
         # instead of an uninitialised local. See lifter.zf_expression.
         needs_zf = set()
+        zf_joins = set()
         zf_probe = [bb for bb in blocks
                     if len(preds[bb.start]) > 1 and bb.start != start
                     and not _incoming_flag_state(preds[bb.start],
@@ -1474,9 +1495,11 @@ class FunctionTranslator:
                 probe, _ = lift_basic_block(self.lifter, bb, flag_state=None)
                 if any("_flags /*" in stmt for stmt in probe):
                     needs_zf.update(preds[bb.start])
+                    zf_joins.add(bb.start)
             self.lifter.unimplemented.clear()
             self.lifter.unimplemented.update(saved)
 
+        from .lifter import zf_expression
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -1497,6 +1520,9 @@ class FunctionTranslator:
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
+            if bb.start in zf_joins and any(
+                    zf_expression(settled_state.get(p)) for p in preds[bb.start]):
+                stmts = [_zf_fallback_polarity(stmt) for stmt in stmts]
             if bb.start in needs_zf:
                 from .lifter import zf_expression
                 zf = zf_expression(out_state[bb.start])
