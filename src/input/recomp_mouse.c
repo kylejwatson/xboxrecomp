@@ -266,13 +266,49 @@ static int cursor_in_client(HWND hwnd)
     return pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
 }
 
+static RECT g_pin;                      /* where the cursor is held */
+
+/* The cursor is pinned to one pixel at the middle of the picture, not just
+ * kept inside the window: raw input still reports every count, and a turn
+ * that runs on can never leave the cursor at an edge, where a click (or a
+ * clip the system dropped, or a DPI-scaled rectangle) lands on a neighbour. */
 static void clip_to_client(HWND hwnd)
 {
     RECT rc;
+    LONG cx, cy;
 
     GetClientRect(hwnd, &rc);
     MapWindowPoints(hwnd, NULL, (POINT *)&rc, 2);
-    ClipCursor(&rc);
+    cx = (rc.left + rc.right) / 2;
+    cy = (rc.top + rc.bottom) / 2;
+    g_pin.left = cx;
+    g_pin.top = cy;
+    g_pin.right = cx + 1;
+    g_pin.bottom = cy + 1;
+    ClipCursor(&g_pin);
+    SetCursorPos(cx, cy);
+    /* Clicks go to this window whatever is under the cursor. */
+    if (GetCapture() != hwnd)
+        SetCapture(hwnd);
+}
+
+/* Something else (another program's ClipCursor, a desktop switch, a dialog)
+ * may have undone the pin without telling the window. */
+static void recheck_pin(HWND hwnd)
+{
+    static DWORD last;
+    DWORD now = GetTickCount();
+    RECT cur;
+
+    if (now - last < 200)
+        return;
+    last = now;
+    if (GetForegroundWindow() != hwnd)
+        return;
+    if (!GetClipCursor(&cur) || cur.left != g_pin.left || cur.top != g_pin.top ||
+        cur.right != g_pin.right || cur.bottom != g_pin.bottom ||
+        GetCapture() != hwnd)
+        clip_to_client(hwnd);
 }
 
 /* Whatever is held now is the click that brought the window back, and the
@@ -317,6 +353,8 @@ static void release(void)
         return;
     ATOMIC_XCHG(&g_captured, 0);
     ClipCursor(NULL);
+    if (g_hwnd && GetCapture() == g_hwnd)
+        ReleaseCapture();
     ATOMIC_XCHG(&g_acc_x, 0);
     ATOMIC_XCHG(&g_acc_y, 0);
 }
@@ -362,8 +400,10 @@ static void raw_mouse(HWND hwnd, const RAWMOUSE *m)
         dx = m->lLastX;
         dy = m->lLastY;
     }
-    if (look && g_captured)
+    if (look && g_captured) {
         recomp_mouse_feed_motion(dx, dy);
+        recheck_pin(hwnd);
+    }
 
     for (i = 0; i < 5; i++) {
         if (f & down[i]) went_down |= 1L << i;
