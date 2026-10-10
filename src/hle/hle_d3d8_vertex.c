@@ -55,6 +55,16 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
 void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *idx,
                                   const void *verts, uint32_t stride, int from_buffer);
 void hle_d3d8_shadow_set_first_vertex(uint32_t first);
+/* From hle_d3d8_push.c: the vertex arrays the title (or the XDK) wrote to the
+ * push buffer, gathered into the declaration's layout when the stream 0 view
+ * does not describe them. stream_base is the contiguous-memory offset the
+ * stream 0 view puts vertex 0 at, ~0u if there is none. */
+const void *hle_d3d8_title_vertices(uint32_t first, uint32_t vertices,
+                                    uint32_t stream_base, uint32_t stream_stride,
+                                    uint32_t *stride);
+/* From hle_d3d8_push.c: leave the enabled attributes' current values at the
+ * draw's last vertex, as the hardware does. */
+void hle_d3d8_push_after_draw(uint32_t last);
 
 #define CONTIG_BASE 0x80000000u
 #define CONTIG_SIZE (64u * 1024u * 1024u)    /* kernel.h XBOX_CONTIG_SIZE */
@@ -79,6 +89,21 @@ static int guest_readable(uint32_t va, uint64_t bytes)
 /* Host pointer to vertex `first` of the stream 0 buffer, for `vertices`
  * vertices, or NULL (counted) if there is no buffer or it would read outside
  * the contiguous window. */
+/* Where the stream 0 view puts vertex `first`, as an offset into contiguous
+ * memory -- what the XDK writes to the NV2A array offsets -- or ~0u. */
+static uint32_t stream0_base(uint32_t first)
+{
+    uint32_t data;
+
+    if (!g_stream0_vb || !g_stream0_stride || !guest_readable(g_stream0_vb, 12u))
+        return ~0u;
+    data = HLE_MEM32(g_stream0_vb + 4u);
+    if (!data)
+        return ~0u;
+    return (uint32_t)(((uint64_t)(data & (CONTIG_SIZE - 1u)) +
+                       (uint64_t)first * g_stream0_stride) & (CONTIG_SIZE - 1u));
+}
+
 static const void *stream0_vertices(uint32_t first, uint32_t vertices)
 {
     uint32_t data, va;
@@ -226,11 +251,17 @@ HLE_EXPORT(D3DDevice_DrawVertices)
     HLE_CALL_ORIGINAL(D3DDevice_DrawVertices);
 #ifdef _WIN32
     if (hle_d3d8_shadow_device() && count) {
-        const void *verts = stream0_vertices(start, count);
+        uint32_t tstride = 0;
+        const void *verts = hle_d3d8_title_vertices(start, count, stream0_base(0u),
+                                                    g_stream0_stride, &tstride);
         if (verts) {
+            /* The arrays the title set itself, in the declaration's layout. */
+            hle_d3d8_shadow_draw(xpt, count, verts, tstride, 1);
+        } else if ((verts = stream0_vertices(start, count)) != NULL) {
             hle_d3d8_shadow_set_first_vertex(start);
             hle_d3d8_shadow_draw(xpt, count, verts, g_stream0_stride, 1);
         }
+        hle_d3d8_push_after_draw(start + count - 1u);
         report();
     }
 #endif
@@ -267,11 +298,16 @@ HLE_EXPORT(D3DDevice_DrawIndexedVertices)
                 fprintf(stderr, "[HLE-D3D8] shadow buffers: CDevice_SetStateVB never "
                         "ran; indexed buffer draws use base vertex 0\n");
         }
-        verts = stream0_vertices(g_base_vertex, vertices);
+        uint32_t tstride = 0;
+        verts = hle_d3d8_title_vertices(0, vertices, stream0_base(g_base_vertex),
+                                        g_stream0_stride, &tstride);
         if (verts) {
+            hle_d3d8_shadow_draw_indexed(xpt, count, idx, verts, tstride, 1);
+        } else if ((verts = stream0_vertices(g_base_vertex, vertices)) != NULL) {
             hle_d3d8_shadow_set_first_vertex(g_base_vertex);
             hle_d3d8_shadow_draw_indexed(xpt, count, idx, verts, g_stream0_stride, 1);
         }
+        hle_d3d8_push_after_draw(idx[count - 1u]);
         report();
     }
 #endif

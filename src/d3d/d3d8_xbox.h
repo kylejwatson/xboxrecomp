@@ -608,6 +608,11 @@ typedef enum D3DCLEAR_FLAGS {
     D3DCLEAR_STENCIL = 0x04,
 } D3DCLEAR_FLAGS;
 
+/* Not PC D3D8: the Xbox's per-channel target bits, carried alongside
+ * D3DCLEAR_TARGET (0x10 R, 0x20 G, 0x40 B, 0x80 A). None set means all
+ * four, as on the PC. dev_Clear honours them. */
+#define D3D8_CLEAR_CHANNELS 0xF0u
+
 /* ================================================================
  * Vertex declaration / FVF
  * ================================================================ */

@@ -125,11 +125,61 @@ static int guest_readable(uint32_t va, uint32_t bytes)
  * Burnout 2 crashed reading one (guest 0xFFFFD9AC) from StopEx while loading a
  * race. A 0 reads as "the buffer changed", and pump() and model_for() retire
  * the slot. */
+/* The DSOUND library build, from the XBE header's library version table
+ * (mapped at 0x10000: count at +0x160, table address at +0x164, 16-byte
+ * entries of name[8], major, minor, build, flags). 0 if it cannot be read. */
+static uint32_t dsound_build(void)
+{
+    static int done;
+    static uint32_t build;
+    uint32_t n, table, i;
+
+    if (done)
+        return build;
+    done = 1;
+    n = HLE_MEM32(0x10160u);
+    table = HLE_MEM32(0x10164u);
+    if (n > 64u || !guest_readable(table, n * 16u))
+        return 0u;
+    for (i = 0; i < n; i++) {
+        const char *name = (const char *)HLE_PTR(table + i * 16u);
+        if (memcmp(name, "DSOUND\0", 7) == 0) {
+            build = HLE_MEM32(table + i * 16u + 12u) & 0xFFFFu;
+            break;
+        }
+    }
+    return build;
+}
+
+/* The buffer half of the settings moved 4 bytes later by XDK 5849
+ * (TimeSplitters: Future Perfect): CDirectSoundBufferSettings_SetBufferData
+ * writes the data pointer to +0xBC and the size to +0xC0, and
+ * CDirectSoundBuffer_SetLoopRegion writes +0xCC/+0xD0 after checking against
+ * the play length at +0xC8. Read with the 5344 offsets, the "size" was the
+ * data pointer (0x8088C080...), so no ADPCM buffer got a model and every
+ * sound effect was silent. The voice half (format, rate, volume) is
+ * unchanged. Which build between 5344 and 5849 moved it is not known; the
+ * ones in between keep the old layout until a title says otherwise. */
+static uint32_t buffer_field_shift(void)
+{
+    static int said;
+    uint32_t build = dsound_build();
+    uint32_t shift = build >= 5849u ? 4u : 0u;
+    if (!said++) {
+        fprintf(stderr, "[DSOUND] library build %u: buffer settings at +0x%02X\n",
+                build, SET_DATA + shift);
+        fflush(stderr);
+    }
+    return shift;
+}
+
 static uint32_t setting(uint32_t iface, uint32_t offset)
 {
     uint32_t holder = voice_field(offset) ? iface - 0x0Cu : iface;
     uint32_t object;
 
+    if (!voice_field(offset))
+        offset += buffer_field_shift();
     if (!guest_readable(holder, 4u))
         return 0u;
     object = HLE_MEM32(holder);

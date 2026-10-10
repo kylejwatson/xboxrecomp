@@ -2602,6 +2602,31 @@ static void vblank_clock_configure(void)
     fflush(stderr);
 }
 
+/* The refresh the title asked D3D for (D3DPRESENT_PARAMETERS
+ * FullScreen_RefreshRateInHz), called from the CreateDevice replacement.
+ *
+ * The console's vblank comes at the rate of the mode the title set, and a
+ * title may count its game time in vblanks. TimeSplitters: Future Perfect is
+ * a PAL disc running 50 Hz: its frame clock is a counter its vertical-blank
+ * callback bumps, so at a fixed 60 Hz everything ran 20% fast -- a 122 s
+ * cutscene track was cut off at 100 s with its picture ahead of the sound,
+ * and scripted lines and events fired early. An explicit RECOMP_VBLANK_HZ
+ * still wins. */
+void xbox_SetVblankRate(unsigned hz)
+{
+    if (!s_vblank_clock.configured)
+        vblank_clock_configure();
+    if (!s_vblank_clock.enabled || s_vblank_clock.legacy || getenv("RECOMP_VBLANK_HZ"))
+        return;
+    if (hz < 24u || hz > 240u || (double)hz == s_vblank_clock.hz)
+        return;
+    s_vblank_clock.hz = (double)hz;
+    s_vblank_clock.period = (LONGLONG)((double)s_vblank_clock.qpf / s_vblank_clock.hz);
+    fprintf(stderr, "  [NV2A] vblank rate: %u Hz, the refresh the title's display mode asked for\n",
+            hz);
+    fflush(stderr);
+}
+
 /* How long the timer thread may sleep before the next vblank is due, in
  * microseconds; 0 when it is due now, and "forever" when the clock is off or
  * running on the legacy pacing, whose loop sleeps a fixed 10 ms. */

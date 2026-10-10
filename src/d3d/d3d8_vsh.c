@@ -523,18 +523,25 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_ILU_EXP:
-        /* dst = exp2(C.x).xxxx */
-        sb_append(&expr, "exp2(");
+        /* The NV2A's EXP is D3D's expp, four different results, not one:
+         *   x = 2^floor(s), y = s - floor(s), z = 2^s, w = 1.
+         * Programs use .y as a cheap frac(): TimeSplitters: Future Perfect
+         * turns a particle's spin into an angle in [-pi, pi) that way before
+         * a Taylor sin/cos, and with 2^s in .y every particle's rotation
+         * blew up into a screen-filling quad. */
+        sb_append(&expr, "nv2a_expp(");
         emit_source(&expr, &inst->ilu_src, 1);
-        sb_append(&expr, ").xxxx");
+        sb_append(&expr, ")");
         break;
 
     case NV2A_VSH_ILU_LOG: {
-        /* dst = log2(abs(C.x)).xxxx
-         * Guard against log2(0) which is -inf on NV2A -> clamp to large negative */
-        sb_append(&expr, "log2(max(abs(");
+        /* D3D's logp, likewise:
+         *   x = floor(log2|s|), y = |s| / 2^x (the mantissa, in [1, 2)),
+         *   z = log2|s|, w = 1.
+         * log2(0) is -inf on the NV2A; it is clamped to a large negative. */
+        sb_append(&expr, "nv2a_logp(");
         emit_source(&expr, &inst->ilu_src, 1);
-        sb_append(&expr, "), 1.175494e-38)).xxxx");
+        sb_append(&expr, ")");
         break;
     }
 
@@ -622,6 +629,16 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    float4 xboxVertexData[%d];\n"
         "    float4 xboxVertexFed[4];\n"
         "};\n"
+        "\n"
+        "float4 nv2a_expp(float s) {\n"
+        "    float f = floor(s);\n"
+        "    return float4(exp2(f), s - f, exp2(s), 1.0);\n"
+        "}\n"
+        "float4 nv2a_logp(float s) {\n"
+        "    float a = max(abs(s), 1.175494e-38);\n"
+        "    float e = floor(log2(a));\n"
+        "    return float4(e, a / exp2(e), log2(a), 1.0);\n"
+        "}\n"
         "\n", NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_INPUTS);
 
     /* Input structure - only declare used inputs */
@@ -638,16 +655,23 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
      * ask for (d3d8_shaders.c and d3d8_combiners.c, PS_IN): fog at TEXCOORD4
      * and a view-space position for table fog at TEXCOORD5. An earlier
      * version wrote fog to FOG, which no pixel shader here reads, so fog
-     * never reached them. The order is only for reading. */
+     * never reached them. The order is only for reading.
+     *
+     * The texture coordinates are float3, as both pixel shaders declare them:
+     * the compiler packs the float fog into TEXCOORD3's register (.w) when
+     * TEXCOORD3 is a float3, and the two sides must pack alike. With float4
+     * here every program's fog was read from oT3.w instead -- a constant,
+     * so TimeSplitters: Future Perfect's canyon came out entirely fog
+     * colour. */
     sb_append(&sb,
         "struct VS_OUT {\n"
         "    float4 oPos : SV_POSITION;\n"
         "    float4 oD0  : COLOR0;\n"
         "    float4 oD1  : COLOR1;\n"
-        "    float4 oT0  : TEXCOORD0;\n"
-        "    float4 oT1  : TEXCOORD1;\n"
-        "    float4 oT2  : TEXCOORD2;\n"
-        "    float4 oT3  : TEXCOORD3;\n"
+        "    float3 oT0  : TEXCOORD0;\n"
+        "    float3 oT1  : TEXCOORD1;\n"
+        "    float3 oT2  : TEXCOORD2;\n"
+        "    float3 oT3  : TEXCOORD3;\n"
         "    float  oFog : TEXCOORD4;\n"
         "    float4 oViewPos : TEXCOORD5;\n"
         "    float  oPts : PSIZE;\n"
@@ -764,10 +788,10 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    o.oPos = oPos;\n"
         "    o.oD0  = saturate(oD0);\n"  /* Colors clamped to [0,1] */
         "    o.oD1  = saturate(oD1);\n"
-        "    o.oT0  = oT0;\n"
-        "    o.oT1  = oT1;\n"
-        "    o.oT2  = oT2;\n"
-        "    o.oT3  = oT3;\n"
+        "    o.oT0  = oT0.xyz;\n"
+        "    o.oT1  = oT1.xyz;\n"
+        "    o.oT2  = oT2.xyz;\n"
+        "    o.oT3  = oT3.xyz;\n"
         "    o.oFog = oFog.x;\n"
         /* Table fog reads -viewpos.z (or its length, for range fog) as the
          * distance; on the Xbox that distance is the program's oFog. */
@@ -1535,6 +1559,15 @@ BOOL d3d8_vsh_get_slot(int slot, DWORD *handle, const DWORD **microcode,
     if (decl)       *decl = vsh->decl;
     if (decl_count) *decl_count = vsh->decl_count;
     return TRUE;
+}
+
+uint32_t d3d8_vsh_slot_hash(DWORD handle)
+{
+    int slot = (int)(handle - 0x10000);
+
+    if (slot < 0 || slot >= NV2A_VS_MAX_SLOTS || !g_vsh_slots[slot].in_use)
+        return 0u;
+    return g_vsh_slots[slot].hash;
 }
 
 BOOL d3d8_vsh_is_programmable(DWORD handle)

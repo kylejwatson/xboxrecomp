@@ -183,12 +183,27 @@ static uint32_t console_av_region(void)
     }
 }
 
+/* A PAL console with 60 Hz enabled in its settings, unless RECOMP_PAL60=0.
+ * A PAL title that offers PAL60 then runs at 60 Hz like the NTSC release
+ * instead of 50; one that does not still gets the vblank rate its mode asks
+ * for (xbox_SetVblankRate). */
+static int pal60_enabled(void)
+{
+    return recomp_config_bool("RECOMP_PAL60", "pal60", 1);
+}
+
 /* The same answer for AvSendTVEncoderOption (kernel_hal.c), which reports the
  * video standard and refresh in the same bits: a title reads its standard from
  * one and D3D validates the mode against the other, so they must agree. */
 uint32_t xbox_kernel_console_av_standard(void)
 {
-    return console_av_region();
+    uint32_t av = console_av_region();
+    /* PAL60 (see XC_VIDEO below): the refresh bits say 60 Hz is available
+     * too, or D3D refuses the 60 Hz mode the title then asks for and
+     * CreateDevice fails. */
+    if (av == XC_AV_STANDARD_PAL_I && pal60_enabled())
+        av |= 0x00400000u;
+    return av;
 }
 
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
@@ -229,6 +244,8 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
             if (recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0))
                 flags |= XC_VIDEO_FLAGS_WIDESCREEN;
+            if (console_av_region() == XC_AV_STANDARD_PAL_I && pal60_enabled())
+                flags |= XC_VIDEO_FLAGS_60Hz;
             *(PULONG)Value = XC_VIDEO_RAW(flags);
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);

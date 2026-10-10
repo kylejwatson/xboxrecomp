@@ -32,6 +32,12 @@ ID3D11Device        *d3d8_GetD3D11Device(void);
 ID3D11DeviceContext *d3d8_GetD3D11Context(void);
 IDXGISwapChain      *d3d8_GetSwapChain(void);
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
+/* d3d8_clearmask.c: clear only the Xbox channels in xbox_channels (0x10 R,
+ * 0x20 G, 0x40 B, 0x80 A) of rtv, inside rects (host pixels) or everywhere.
+ * FALSE if it could not, and the caller clears the whole view. */
+BOOL d3d8_ClearChannels(ID3D11RenderTargetView *rtv, UINT xbox_channels,
+                        const float color[4], UINT rect_count, const D3D11_RECT *rects);
+void d3d8_ClearChannelsShutdown(void);
 /* The host back buffer's size, which is what clip space maps onto. */
 UINT                 d3d8_GetBackBufferWidth(void);
 UINT                 d3d8_GetBackBufferHeight(void);

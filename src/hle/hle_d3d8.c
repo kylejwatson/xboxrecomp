@@ -623,6 +623,26 @@ struct shadow_program {
 #define NO_FIRST_VERTEX 0xFFFFFFFFu
 static uint32_t g_draw_first = NO_FIRST_VERTEX;
 void hle_d3d8_shadow_set_first_vertex(uint32_t first) { g_draw_first = first; }
+
+/* The guest vertex shader object of the program selected now, for
+ * hle_d3d8_push.c, which lays the title's own arrays out to match its
+ * declaration; 0 when the selected shader is not a program. */
+uint32_t hle_d3d8_shadow_program_object(void);
+/* hle_d3d8_push.c. A draw reaches the host only after the push buffer up to it
+ * has been read: the XDK's inlined constant setters and the title's own
+ * BeginPush blocks write vertex constants there and nowhere else, and a draw
+ * that ran ahead of the walk was transformed by the previous object's
+ * matrices. */
+void hle_d3d8_push_sync(void);
+void hle_d3d8_push_check_declaration(uint32_t object);
+static void shadow_sync_program(void);
+static void shadow_sync_push(void)
+{
+    hle_d3d8_push_sync();
+    shadow_sync_program();
+    hle_d3d8_push_check_declaration(hle_d3d8_shadow_program_object());
+}
+
 /* From hle_d3d8_vertex.c: vertex `first` of stream `stream`, or NULL. */
 const void *hle_d3d8_stream_vertices(uint32_t stream, uint32_t first, uint32_t vertices,
                                      uint32_t *stride);
@@ -717,6 +737,73 @@ static int slot_program_cached(DWORD host)
 }
 
 static void shadow_read_declaration(int slot, uint32_t handle);
+
+/* A host program for this microcode: the cached one, or a new one added to
+ * the cache. 0 if it could not be made. */
+static DWORD slot_program_host(const DWORD *microcode, int count, int *created)
+{
+    uint32_t hash = microcode_hash(microcode, count);
+    int i = slot_program_find(hash, count, microcode);
+    DWORD host = 0;
+
+    *created = 0;
+    if (i >= 0) {
+        g_slot_reloads++;
+        return g_slot_programs[i].host;
+    }
+    if (FAILED(host_vsh_create_shader(microcode, count, &host)))
+        return 0;
+    *created = 1;
+    if (g_slot_program_count < SLOT_PROGRAM_CACHE) {
+        SlotProgram *sp = &g_slot_programs[g_slot_program_count++];
+        sp->hash = hash;
+        sp->count = count;
+        sp->host = host;
+    }
+    return host;
+}
+
+/* hle_d3d8_push.c: the program the hardware runs next, from the push buffer. */
+int hle_d3d8_push_program(const uint32_t **microcode, int *count);
+static unsigned long g_push_program_swaps;
+
+/* Before a draw: if the program the push buffer started is not the one the
+ * selected shader carries, draw with the push buffer's, under the selected
+ * object's declaration. A title that loads programs into the transform slots
+ * itself (FP's skinning) is otherwise drawn with the last program the XDK
+ * selected. RECOMP_HLE_D3D8_PUSH_PROGRAM=0 turns it off. */
+static void shadow_sync_program(void)
+{
+    static int on = -1;
+    struct shadow_program *p;
+    const uint32_t *microcode;
+    int count, created;
+    DWORD host;
+
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_PUSH_PROGRAM", 1);
+    if (!on || !g_shadow || !g_shadow_vs_is_program || g_shadow_vs_slot < 0 ||
+        g_shadow_vs_kind != SHADER_HOST_PROGRAM)
+        return;
+    p = &g_programs[g_shadow_vs_slot];
+    if (!hle_d3d8_push_program(&microcode, &count) ||
+        host_vsh_same_microcode(p->host, (const DWORD *)microcode, count))
+        return;
+    host = slot_program_host((const DWORD *)microcode, count, &created);
+    if (!host)
+        return;
+    if (created && g_push_program_swaps < 16)
+        fprintf(stderr, "[HLE-D3D8] shadow vertex shader 0x%08X: runs a program "
+                "the push buffer loaded (%d instructions)\n", g_shadow_vs, count);
+    g_push_program_swaps++;
+    /* The entry now names a cached program, which must outlive it. */
+    if (!p->from_slot && !slot_program_cached(p->host))
+        host_vsh_delete_shader(p->host);
+    p->host = host;
+    p->from_slot = 1;
+    shadow_read_declaration(g_shadow_vs_slot, g_shadow_vs);
+    host_SetVertexShader(g_shadow, host);
+}
 
 static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
 {
@@ -839,6 +926,11 @@ static void note_draw_format(uint32_t xpt, uint32_t stride)
     }
 }
 
+uint32_t hle_d3d8_shadow_program_object(void)
+{
+    return g_shadow_vs_is_program ? (g_shadow_vs & ~1u) : 0u;
+}
+
 /* Common checks for a draw under the current vertex shader. */
 static int shadow_can_draw(uint32_t xpt, uint32_t stride)
 {
@@ -862,6 +954,27 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
             return 0;
         }
         if (stride < p->extent) {        /* the layout would read past a vertex */
+            static uint32_t said[32];
+            static int nsaid;
+            int k, fresh;
+            for (k = 0; k < nsaid && said[k] != (g_shadow_vs ^ (stride << 20) ^ ((uint32_t)p->extent << 8)); k++) ;
+            fresh = (k == nsaid && nsaid < 32);
+            if (fresh) {
+                said[nsaid++] = g_shadow_vs ^ (stride << 20) ^ ((uint32_t)p->extent << 8);
+                fprintf(stderr, "[HLE-D3D8] stride skip: program 0x%08X extent %u > stride %u, primitive %u\n",
+                        g_shadow_vs, (unsigned)p->extent, stride, xpt);
+            }
+            if (fresh && getenv("RECOMP_HLE_D3D8_DECL_DUMP")) {
+                uint32_t object = g_shadow_vs & ~1u, q;
+                fprintf(stderr, "[HLE-D3D8]   guest declaration now:");
+                for (q = 0; q < 16u; q++) {
+                    uint32_t at = object + 20u + q * 16u;
+                    if (HLE_MEM32(at + 8u) > 0x02u)
+                        fprintf(stderr, " v%u(s%u +%u fmt 0x%02X)", q, HLE_MEM32(at),
+                                HLE_MEM32(at + 4u), HLE_MEM32(at + 8u));
+                }
+                fputc(10, stderr);
+            }
             g_draws_stride++;
             return 0;
         }
@@ -1427,6 +1540,11 @@ HLE_EXPORT(Direct3D_CreateDevice)
                 HLE_MEM32(pp_va + 0x0), HLE_MEM32(pp_va + 0x4), HLE_MEM32(pp_va + 0x8),
                 HLE_MEM32(pp_va + 0xC), g_swap_effect, HLE_MEM32(pp_va + 0x28),
                 HLE_MEM32(pp_va + 0x2C), HLE_MEM32(pp_va + 0x30), g_eax);
+        /* The vblank comes at the mode's refresh (kernel_bridge.c). */
+        if ((int32_t)g_eax >= 0) {
+            extern void xbox_SetVblankRate(unsigned hz);
+            xbox_SetVblankRate(HLE_MEM32(pp_va + 0x2C));
+        }
     }
     if (!g_backbuffer_va)
         fprintf(stderr, "[HLE-D3D8] CreateDevice set no render target; the back "
@@ -1459,7 +1577,25 @@ HLE_EXPORT(D3DDevice_Clear)
         if (g_shadow_clears < 4)
             fprintf(stderr, "[HLE-D3D8] shadow Clear: flags 0x%08X color 0x%08X "
                     "z %g stencil %u\n", flags, color, z, stencil);
-        host_Clear(g_shadow, 0, NULL, xbox_clear_flags_to_host(flags), color, z, stencil);
+        /* The title's rectangles, D3DRECT { x1, y1, x2, y2 } in guest
+         * pixels: a boxed clear (FP's control hints) is not a full one. */
+        {
+            uint32_t count = HLE_ARG(0), rects_va = HLE_ARG(1), i;
+            D3DRECT rects[16];
+
+            if (count > 16)
+                count = 16;
+            if (!rects_va)
+                count = 0;
+            for (i = 0; i < count; i++) {
+                rects[i].x1 = (LONG)HLE_MEM32(rects_va + i * 16u);
+                rects[i].y1 = (LONG)HLE_MEM32(rects_va + i * 16u + 4u);
+                rects[i].x2 = (LONG)HLE_MEM32(rects_va + i * 16u + 8u);
+                rects[i].y2 = (LONG)HLE_MEM32(rects_va + i * 16u + 12u);
+            }
+            host_Clear(g_shadow, count, count ? rects : NULL,
+                       xbox_clear_flags_to_host(flags), color, z, stencil);
+        }
         g_shadow_clears++;
         g_shadow_last_color = color;
         if (shadow_trace_on())
@@ -1988,6 +2124,16 @@ static void shadow_read_declaration(int slot, uint32_t handle)
         n++;
     }
 
+    if (getenv("RECOMP_HLE_D3D8_DECL_DUMP")) {
+        fprintf(stderr, "[HLE-D3D8] declaration 0x%08X:", handle);
+        for (i = 0; i < 16u; i++) {
+            uint32_t attr = object + 20u + i * 16u;
+            if (HLE_MEM32(attr + 8u) > 0x02u)
+                fprintf(stderr, " v%u(s%u +%u fmt 0x%02X)", i, HLE_MEM32(attr),
+                        HLE_MEM32(attr + 4u), HLE_MEM32(attr + 8u));
+        }
+        fputc('\n', stderr);
+    }
     if (!refused && n > 0 && SUCCEEDED(host_vsh_set_declaration(p->host, in, n))) {
         p->has_declaration = 1;
         p->packed_count = packed;
@@ -3375,6 +3521,7 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
 
     if (!g_shadow || !verts || !stride || !count)
         return;
+    shadow_sync_push();
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
@@ -3432,6 +3579,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
 
     if (!g_shadow || !idx || !verts || !stride || !count)
         return;
+    shadow_sync_push();
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {

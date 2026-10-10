@@ -13,6 +13,7 @@ if(WIN32)
         d3d8_overlay.c
         d3d8_movie.c
         d3d8_screencopy.c
+        d3d8_clearmask.c
         d3d8_display.c
     )
     # gdi32: the overlay renders its text with GDI rather than an embedded font.

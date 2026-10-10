@@ -25,7 +25,7 @@
  *                    capture's combiner token says.
  *   --draws <n>      execute only the first n draws (state still applied;
  *                    clears after the nth draw are skipped too).
- *   --skip-draw <n>  leave out draw n (0-based).
+ *   --skip-draw <n>[-<m>]  leave out draw n, or draws n..m (0-based).
  *   --list-draws     print every draw with the state it runs under.
  *
  * A player, not an emulator. A capture holds the calls shadow mode
@@ -71,11 +71,11 @@ static int g_quiet;
  * same moment. */
 static int g_no_combiners;
 /* Draw-level bisection: --draws N executes only the first N draws, --skip-draw
- * N leaves out draw N (0-based), --list-draws prints each draw with the state
+ * N (or N-M) leaves out draw N (0-based) or that range, --list-draws prints each draw with the state
  * it runs under. State chunks always run, so a draw left out changes nothing
  * but its own pixels. */
 static long g_max_draws = -1;
-static long g_skip_draw = -1;
+static long g_skip_draw = -1, g_skip_last = -1;
 static int  g_list_draws;
 static long g_draw_index;           /* draws seen in this loop */
 static DWORD g_cur_vs, g_cur_token;
@@ -95,9 +95,17 @@ static void tex_desc(char *buf, size_t n, uint32_t id)
 }
 
 /* 1 if this draw should run, after listing it if asked. */
+/* REPLAY_NO_CULL=1 / REPLAY_NO_Z=1: draw every triangle whatever its winding,
+ * or whatever is in front of it, to tell missing geometry from hidden geometry. */
+static IDirect3DDevice8 *g_dev;
+
 static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t stride)
 {
     long n = g_draw_index++;
+    if (g_dev && getenv("REPLAY_NO_CULL"))
+        g_dev->lpVtbl->SetRenderState(g_dev, D3DRS_CULLMODE, D3DCULL_NONE);
+    if (g_dev && getenv("REPLAY_NO_Z"))
+        g_dev->lpVtbl->SetRenderState(g_dev, D3DRS_ZFUNC, D3DCMP_ALWAYS);
 
     if (g_list_draws) {
         const DWORD *rs = d3d8_GetRenderStates();
@@ -107,26 +115,46 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
         tex_desc(t1, sizeof t1, g_stage_tex[1]);
         fprintf(stderr, "[draw %4ld] tex %s %s\n", n, t0, t1);
         fprintf(stderr, "[draw %4ld] %-8s prim %u x%-5u stride %2u  vs 0x%05lX  ps %lu  "
-                "blend %lu %lu>%lu  atest %lu ref %lu  z %lu/%lu  fog %lu  cull %lu%s%s\n",
+                "blend %lu %lu>%lu  atest %lu ref %lu  z %lu/%lu  fog %lu  cull %lu  prog %08X%s%s\n",
                 n, kind, prim, count, stride, (unsigned long)g_cur_vs,
                 (unsigned long)(g_no_combiners ? 0 : g_cur_token),
                 (unsigned long)rs[D3DRS_ALPHABLENDENABLE], (unsigned long)rs[D3DRS_SRCBLEND],
                 (unsigned long)rs[D3DRS_DESTBLEND], (unsigned long)rs[D3DRS_ALPHATESTENABLE],
                 (unsigned long)rs[D3DRS_ALPHAREF], (unsigned long)rs[D3DRS_ZENABLE],
                 (unsigned long)rs[D3DRS_ZWRITEENABLE], (unsigned long)rs[D3DRS_FOGENABLE],
-                (unsigned long)rs[D3DRS_CULLMODE],
+                (unsigned long)rs[D3DRS_CULLMODE], d3d8_vsh_slot_hash(g_cur_vs),
                 (g_max_draws >= 0 && n >= g_max_draws) ? "  (not drawn: --draws)" : "",
-                n == g_skip_draw ? "  (not drawn: --skip-draw)" : "");
+                (n >= g_skip_draw && n <= g_skip_last) ? "  (not drawn: --skip-draw)" : "");
+        /* REPLAY_SHOW_CONSTANTS=<first>[,<count>]: those registers as this
+         * draw sees them (default four: one matrix). */
+        if (getenv("REPLAY_SHOW_CONSTANTS")) {
+            const float *c = d3d8_vsh_constants();
+            unsigned first = 0, cnt = 4, r;
+            sscanf(getenv("REPLAY_SHOW_CONSTANTS"), "%u,%u", &first, &cnt);
+            for (r = first; r < first + cnt && r < 192u; r++)
+                fprintf(stderr, "[draw %4ld] c%u = %g %g %g %g\n", n, r,
+                        c[r * 4], c[r * 4 + 1], c[r * 4 + 2], c[r * 4 + 3]);
+        }
         /* The states that discard fragments without leaving a mark. */
         fprintf(stderr, "[draw %4ld] zfunc %lu afunc %lu colorwrite 0x%lX stencil %lu "
                 "fill %lu shade %lu\n", n,
                 (unsigned long)rs[D3DRS_ZFUNC], (unsigned long)rs[D3DRS_ALPHAFUNC],
                 (unsigned long)rs[D3DRS_COLORWRITEENABLE], (unsigned long)rs[D3DRS_STENCILENABLE],
                 (unsigned long)rs[D3DRS_FILLMODE], (unsigned long)rs[D3DRS_SHADEMODE]);
+        if (rs[D3DRS_FOGENABLE]) {
+            float fs, fe, fd;
+            memcpy(&fs, &rs[D3DRS_FOGSTART], 4);
+            memcpy(&fe, &rs[D3DRS_FOGEND], 4);
+            memcpy(&fd, &rs[D3DRS_FOGDENSITY], 4);
+            fprintf(stderr, "[draw %4ld] fog table %lu vertex %lu range %lu start %g end %g "
+                    "density %g color %08lX\n", n, (unsigned long)rs[D3DRS_FOGTABLEMODE],
+                    (unsigned long)rs[D3DRS_FOGVERTEXMODE], (unsigned long)rs[D3DRS_RANGEFOGENABLE],
+                    fs, fe, fd, (unsigned long)rs[D3DRS_FOGCOLOR]);
+        }
     }
     if (g_max_draws >= 0 && n >= g_max_draws)
         return 0;
-    return n != g_skip_draw;
+    return !(n >= g_skip_draw && n <= g_skip_last);
 }
 
 static void note(const char *fmt, ...)
@@ -367,6 +395,24 @@ static void do_texture(Replay *r, const D3D8CapChunk *c)
          * a tint -- so its bytes are the value that matters. */
         fprintf(stderr, "[texture %u] %ux%u format 0x%02X: %02X %02X %02X %02X\n",
                 t->id, t->width, t->height, t->format, bytes[0], bytes[1], bytes[2], bytes[3]);
+    }
+
+    /* REPLAY_TEX_DUMP=<id>: write that texture's level 0, as recorded, to
+     * tex_<id>.bin, for looking at a texture that samples wrong. */
+    {
+        const char *want = getenv("REPLAY_TEX_DUMP");
+        if (want && (uint32_t)atoi(want) == t->id && t->levels) {
+            char name[64];
+            FILE *f;
+            snprintf(name, sizeof name, "tex_%u.bin", t->id);
+            if ((f = fopen(name, "wb")) != NULL) {
+                fwrite(bytes, 1, levels[0].bytes, f);
+                fclose(f);
+            }
+            fprintf(stderr, "[texture %u] %ux%u format 0x%02X pitch %u rows %u -> %s\n",
+                    t->id, t->width, t->height, t->format, levels[0].pitch,
+                    levels[0].rows, name);
+        }
     }
 
     /* An id seen again is the same texture written again (a later loop, or a
@@ -724,6 +770,14 @@ static void do_draw_indexed_up(Replay *r, const D3D8CapChunk *c)
                 d->num_vertices, d->min_index, d->vertex_bytes,
                 ix[0], ix[1], ix[2], ix[3],
                 ix[0], f[0], f[1], f[2], f[3], ix[1], g[0], g[1], g[2], g[3]);
+        {
+            const uint32_t *w = (const uint32_t *)f;
+            uint32_t k;
+            fprintf(stderr, "[draw %4ld] v[%u] raw", g_draw_index - 1, ix[0]);
+            for (k = 0; k < d->stride / 4u && k < 16u; k++)
+                fprintf(stderr, " %08X", w[k]);
+            fprintf(stderr, "\n");
+        }
     }
     if (FAILED(r->dev->lpVtbl->DrawIndexedPrimitiveUP(
             r->dev, (D3DPRIMITIVETYPE)d->prim_type, d->min_index, d->num_vertices,
@@ -764,9 +818,13 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         /* A clear after the --draws limit would wipe the draws kept before
          * it, so it counts as drawing. */
         if (g_list_draws)
-            fprintf(stderr, "[clear after %ld draws] flags 0x%X color 0x%08X z %g%s\n",
-                    g_draw_index, p->flags, p->color, p->z,
+            fprintf(stderr, "[clear after %ld draws] flags 0x%X color 0x%08X z %g, %u rect(s)%s%s\n",
+                    g_draw_index, p->flags, p->color, p->z, p->rect_count,
+                    p->rect_count ? " first " : "",
                     (g_max_draws >= 0 && g_draw_index >= g_max_draws) ? "  (skipped)" : "");
+        if (g_list_draws && p->rect_count)
+            fprintf(stderr, "[clear]   %d,%d-%d,%d\n", rects[0].x1, rects[0].y1,
+                    rects[0].x2, rects[0].y2);
         if (g_max_draws >= 0 && g_draw_index >= g_max_draws)
             break;
         r->dev->lpVtbl->Clear(r->dev, p->rect_count, p->rect_count ? out : NULL,
@@ -945,6 +1003,11 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
                     p->first_reg + 1, p->count > 1 ? data[4] : 0.f,
                     p->count > 1 ? data[5] : 0.f, p->count > 1 ? data[6] : 0.f,
                     p->count > 1 ? data[7] : 0.f);
+            /* REPLAY_ALL_CONSTANTS=1: every register of a bulk upload. */
+            if (p->count > 2 && getenv("REPLAY_ALL_CONSTANTS"))
+                for (i = 0; i < p->count; i++)
+                    fprintf(stderr, "[constants]   c%u = %g %g %g %g\n", p->first_reg + i,
+                            data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]);
         }
         d3d8_vsh_set_constant((int)p->first_reg, data, (int)p->count);
         break;
@@ -969,6 +1032,9 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             r->malformed++;
             break;
         }
+        if (g_list_draws)
+            fprintf(stderr, "[vertex data] v%d = %g %g %g %g\n", (int)p->reg,
+                    p->value[0], p->value[1], p->value[2], p->value[3]);
         d3d8_vsh_set_vertex_data((int)p->reg, p->value);
         break;
     }
@@ -1077,7 +1143,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--draws") && i + 1 < argc)
             g_max_draws = atol(argv[++i]);
         else if (!strcmp(argv[i], "--skip-draw") && i + 1 < argc)
-            g_skip_draw = atol(argv[++i]);
+            {
+                char *end;
+                g_skip_draw = strtol(argv[++i], &end, 10);
+                g_skip_last = *end == '-' ? strtol(end + 1, NULL, 10) : g_skip_draw;
+            }
         else if (!strcmp(argv[i], "--list-draws"))
             g_list_draws = 1;
         else if (argv[i][0] == '-') {
@@ -1124,6 +1194,7 @@ int main(int argc, char **argv)
     d3d = xbox_Direct3DCreate8(0);
     hr = d3d ? d3d->lpVtbl->CreateDevice(d3d, 0, 1 /* HAL */, hwnd, 0, &pp, &r.dev)
              : E_FAIL;
+    g_dev = r.dev;
     if (FAILED(hr) || !r.dev) {
         fprintf(stderr, "[replay] CreateDevice failed (0x%08lX)\n", (unsigned long)hr);
         d3d8cap_close_read(cap);

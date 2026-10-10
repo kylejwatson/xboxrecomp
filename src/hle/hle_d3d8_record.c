@@ -819,7 +819,7 @@ HRESULT host_Clear(IDirect3DDevice8 *dev, DWORD count, const D3DRECT *rects,
         D3D8CapRect r[16];
         DWORD i, n = rects ? count : 0;
 
-        if (n > 16)                      /* src/hle passes none; more is a bug */
+        if (n > 16)                      /* src/hle passes at most 16 */
             n = 16;
         for (i = 0; i < n; i++) {
             r[i].x1 = rects[i].x1;

@@ -169,6 +169,10 @@ const float *d3d8_vsh_constants(void);
  */
 BOOL d3d8_vsh_is_programmable(DWORD handle);
 
+/** The microcode hash of the program in a handle's slot (the one the
+ *  "Compiled shader (hash ...)" line names), 0 if none. For diagnostics. */
+uint32_t d3d8_vsh_slot_hash(DWORD handle);
+
 /**
  * Give a program the vertex layout its declaration describes. Registers the
  * program reads are bound at these formats and offsets instead of being

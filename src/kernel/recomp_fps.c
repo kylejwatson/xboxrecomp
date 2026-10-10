@@ -233,6 +233,52 @@ static DWORD WINAPI fps_reporter(LPVOID param)
                 InterlockedExchange(&s_span[0], 0), InterlockedExchange(&s_span[1], 0),
                 InterlockedExchange(&s_span[2], 0), InterlockedExchange(&s_span[3], 0),
                 InterlockedExchange(&s_span[4], 0));
+        /* RECOMP_FPS_WATCH=<guest address>: a title's own frame clock (a
+         * counter its vblank callback bumps, say), read each window, so "the
+         * title's time runs slow" is a number rather than an impression. */
+        {
+            static uint32_t watch_va, last;
+            static int init;
+            extern ptrdiff_t g_xbox_mem_offset;
+            if (!init) {
+                const char *w = getenv("RECOMP_FPS_WATCH");
+                init = 1;
+                watch_va = w ? (uint32_t)strtoul(w, NULL, 0) : 0u;
+            }
+            if (watch_va) {
+                uint32_t v = *(volatile uint32_t *)((uintptr_t)watch_va + g_xbox_mem_offset);
+                fprintf(stderr, "[FPS]   guest %08X = %u (+%.1f/s)\n", watch_va, v,
+                        (double)(v - last) / window);
+                last = v;
+            }
+        }
+        /* RECOMP_RAM_DUMP=<dir> with RECOMP_RAM_DUMP_AT=<s>[,<s>...]: guest
+         * RAM written to <dir>/ram_<s>.bin at the first report at or after
+         * each time, for finding a game structure offline by diffing two
+         * moments (where the inventory lives, before a RECOMP_WATCH_WRITE). */
+        {
+            static const char *dir, *at;
+            static int init;
+            extern ptrdiff_t g_xbox_mem_offset;
+            if (!init) {
+                init = 1;
+                dir = getenv("RECOMP_RAM_DUMP");
+                at = getenv("RECOMP_RAM_DUMP_AT");
+            }
+            if (dir && at && *at && elapsed >= atof(at)) {
+                char path[512];
+                FILE *f;
+                snprintf(path, sizeof path, "%s/ram_%.0f.bin", dir, elapsed);
+                f = fopen(path, "wb");
+                if (f) {
+                    fwrite((const void *)(uintptr_t)g_xbox_mem_offset, 1, g_xbox_total_ram, f);
+                    fclose(f);
+                    fprintf(stderr, "[FPS]   guest RAM written to %s\n", path);
+                }
+                at = strchr(at, ',');
+                at = at ? at + 1 : NULL;
+            }
+        }
         if (wp_on()) {
             double ms_per_tick = 1000.0 / (double)qpf.QuadPart;
             EnterCriticalSection(&s_wp_cs);

@@ -631,6 +631,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         d3d8_overlay_shutdown();
         d3d8_movie_shutdown();
         xbox_D3D8ScreenCopyShutdown();
+        d3d8_ClearChannelsShutdown();
         d3d8_display_shutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
@@ -787,6 +788,28 @@ static HRESULT __stdcall dev_EndScene(IDirect3DDevice8 *self)
     return S_OK;
 }
 
+/* The title's clear rectangles, guest pixels to host ones (scaled like the
+ * viewport), empty ones dropped. */
+static UINT scale_clear_rects(DWORD count, const D3DRECT *rects, D3D11_RECT out[16])
+{
+    float sx = rt_scale_x(), sy = rt_scale_y();
+    UINT n = 0;
+    DWORD i;
+
+    for (i = 0; rects && i < count && n < 16; i++) {
+        LONG x1 = rects[i].x1 < 0 ? 0 : rects[i].x1;
+        LONG y1 = rects[i].y1 < 0 ? 0 : rects[i].y1;
+        if (rects[i].x2 <= x1 || rects[i].y2 <= y1)
+            continue;
+        out[n].left   = (LONG)((float)x1 * sx);
+        out[n].top    = (LONG)((float)y1 * sy);
+        out[n].right  = (LONG)((float)rects[i].x2 * sx);
+        out[n].bottom = (LONG)((float)rects[i].y2 * sy);
+        n++;
+    }
+    return n;
+}
+
 static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
 {
     (void)self; (void)Count; (void)pRects; (void)Stencil;
@@ -804,9 +827,30 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
             ((Color >>  0) & 0xFF) / 255.0f,  /* B */
             ((Color >> 24) & 0xFF) / 255.0f,  /* A */
         };
-        ID3D11DeviceContext_ClearRenderTargetView(g_device_state.d3d11_context,
-                                                   rtv,
-                                                   clear_color);
+        /* Two things the PC's Clear has no word for, both carried in from
+         * the Xbox call: rectangles, and a channel mask (Flags 0x10 R, 0x20
+         * G, 0x40 B, 0x80 A; none of them set means all four).
+         * TimeSplitters: Future Perfect clears alpha alone before its
+         * on-screen control hints, and a whole clear for that blacked out
+         * the game behind every hint. Either one is a masked draw
+         * (d3d8_clearmask.c). Depth and stencil below are still cleared
+         * whole: D3D11 cannot clear part of a depth view. */
+        UINT channels = Flags & D3D8_CLEAR_CHANNELS;
+        if (channels == D3D8_CLEAR_CHANNELS)
+            channels = 0;
+        if (channels || (Count && pRects)) {
+            D3D11_RECT r[16];
+            UINT n = scale_clear_rects(Count, pRects, r);
+
+            if ((Count && pRects && !n) ||
+                d3d8_ClearChannels(rtv, channels ? channels : D3D8_CLEAR_CHANNELS,
+                                   clear_color, n, r))
+                channels = D3D8_CLEAR_CHANNELS;   /* done */
+        }
+        if (channels != D3D8_CLEAR_CHANNELS)
+            ID3D11DeviceContext_ClearRenderTargetView(g_device_state.d3d11_context,
+                                                       rtv,
+                                                       clear_color);
     }
 
     if ((Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) && dsv) {

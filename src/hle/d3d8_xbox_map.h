@@ -25,16 +25,17 @@ enum {
 
 /* Xbox D3DCLEAR_* bits: TARGET is 0xF0, one bit per channel (0x10 R, 0x20 G,
  * 0x40 B, 0x80 A); ZBUFFER is 0x01 and STENCIL 0x02. The host layer takes the
- * PC values. Two things are not honoured: a per-channel target mask (any
- * target bit clears all four channels, as Cxbx-Reloaded also does) and clear
- * rectangles, which the host dev_Clear ignores, so a rectangle-limited clear
- * clears the whole target. */
+ * PC values, plus the channel bits as they are when only some are set
+ * (D3D8_CLEAR_CHANNELS): TimeSplitters: Future Perfect clears alpha alone,
+ * and clearing all four blacked out the game behind its control hints. */
 static __inline DWORD xbox_clear_flags_to_host(uint32_t xbox_flags)
 {
     DWORD host = 0;
 
     if (xbox_flags & 0xF0)
         host |= D3DCLEAR_TARGET;
+    if ((xbox_flags & 0xF0) && (xbox_flags & 0xF0) != 0xF0)
+        host |= xbox_flags & 0xF0;
     if (xbox_flags & 0x01)
         host |= D3DCLEAR_ZBUFFER;
     if (xbox_flags & 0x02)

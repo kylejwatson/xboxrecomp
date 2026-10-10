@@ -48,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #include "hle.h"
 #include "xbox_adpcm.h"
@@ -99,6 +100,7 @@ typedef struct Stream {
     uint32_t iface;                  /* IDirectSoundStream the title holds */
     uint32_t object;                 /* CDirectSoundStream, bound at first use */
     uint32_t tag, channels, rate, bits, align;
+    uint32_t created_rate;           /* the rate in the creation format; SetFrequency(0) restores it */
     uint32_t max_packets;
     uint32_t callback, context;      /* LPFNXMEDIAOBJECTCALLBACK, its context */
     int      output;                 /* the host can play this format */
@@ -154,6 +156,27 @@ static uint64_t now_ms(void) { return GetTickCount64(); }
 /* Name the first few call sites of a replaced stream method, once each: a
  * title that waits on a status this file reports differently from the console
  * is found by reading the caller. */
+/* RECOMP_DSOUND_TRACE=1: every stream call and packet completion, with the
+ * host time, for lining the sound up against the picture. */
+static void trace(const char *fmt, ...)
+{
+    static int on = -1;
+    static uint64_t t0;
+    va_list ap;
+
+    if (on < 0) {
+        on = xbox_EnvSwitch("RECOMP_DSOUND_TRACE", 0);
+        t0 = GetTickCount64();
+    }
+    if (!on)
+        return;
+    fprintf(stderr, "[DSTRACE] %8llu ms ", (unsigned long long)(GetTickCount64() - t0));
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
 static void note_caller(const char *what)
 {
     static uint32_t seen[12];
@@ -313,6 +336,7 @@ static Stream *find_by_object(uint32_t object)
 static void complete(Stream *s, const Packet *p, uint32_t status, uint32_t size)
 {
     g_packets_done++;
+    trace("%08X complete %08X status %08X size %u", s->iface, p->data, status, size);
     if (p->status_va && guest_readable(p->status_va, 4u))
         HLE_MEM32(p->status_va) = status;
     if (p->completed_va && guest_readable(p->completed_va, 4u))
@@ -484,6 +508,29 @@ void hle_dsound_stream_tick(uint64_t now)
     unlock();
 }
 
+/* Take the stream's format from a guest WAVEFORMATEX (the caller has checked
+ * 16 bytes are readable). */
+static void set_format(Stream *s, uint32_t wfx)
+{
+    s->tag         = HLE_MEM32(wfx) & 0xFFFFu;
+    s->channels    = HLE_MEM32(wfx) >> 16;
+    s->rate        = HLE_MEM32(wfx + 4u);
+    s->created_rate = s->rate;
+    /* RECOMP_DSOUND_STREAM_RATE=<Hz> plays every stream at that rate instead:
+     * a listening test for "the music is too fast or too slow". */
+    {
+        const char *forced = getenv("RECOMP_DSOUND_STREAM_RATE");
+        if (forced && atoi(forced) >= 1000 && atoi(forced) <= 200000)
+            s->rate = (uint32_t)atoi(forced);
+    }
+    s->align       = HLE_MEM32(wfx + 12u) & 0xFFFFu;
+    s->bits        = HLE_MEM32(wfx + 12u) >> 16;
+    s->output = s->channels >= 1u && s->channels <= 2u &&
+                s->rate >= 1000u && s->rate <= 200000u &&
+                ((s->tag == TAG_PCM && (s->bits == 8u || s->bits == 16u)) ||
+                 (s->tag == TAG_ADPCM && s->bits == 4u));
+}
+
 /* Record a stream the title just created, from its DSSTREAMDESC:
  *   +0 dwFlags  +4 dwMaxAttachedPackets  +8 lpwfxFormat  +C lpMixBins
  *   +10 lpfnCallback  +14 lpvContext
@@ -518,18 +565,10 @@ static void record_stream(uint32_t iface, uint32_t desc)
     }
     memset(s, 0, sizeof *s);
     s->iface       = iface;
-    s->tag         = HLE_MEM32(wfx) & 0xFFFFu;
-    s->channels    = HLE_MEM32(wfx) >> 16;
-    s->rate        = HLE_MEM32(wfx + 4u);
-    s->align       = HLE_MEM32(wfx + 12u) & 0xFFFFu;
-    s->bits        = HLE_MEM32(wfx + 12u) >> 16;
+    set_format(s, wfx);
     s->max_packets = max_packets && max_packets < MAX_PACKETS ? max_packets : MAX_PACKETS;
     s->callback    = callback;
     s->context     = context;
-    s->output = s->channels >= 1u && s->channels <= 2u &&
-                s->rate >= 1000u && s->rate <= 200000u &&
-                ((s->tag == TAG_PCM && (s->bits == 8u || s->bits == 16u)) ||
-                 (s->tag == TAG_ADPCM && s->bits == 4u));
     if (said < 8) {
         said++;
         fprintf(stderr, "[DSOUND] stream %08X: tag %04X %u ch %u Hz %u bit align %u, "
@@ -543,6 +582,8 @@ static void record_stream(uint32_t iface, uint32_t desc)
 HLE_ORIGINAL(DirectSoundCreateStream);
 HLE_ORIGINAL(CDirectSound_CreateSoundStream);
 HLE_ORIGINAL(CDirectSoundStream_SetVolume);
+HLE_ORIGINAL(CDirectSoundStream_SetFrequency);
+HLE_ORIGINAL(CDirectSoundStream_SetFormat);
 
 /* HRESULT DirectSoundCreateStream(LPCDSSTREAMDESC pdssd,
  *     LPDIRECTSOUNDSTREAM *ppStream) */
@@ -619,6 +660,10 @@ HLE_EXPORT(CDirectSoundStream_Process)
     s->count++;
     if (p->status_va && guest_readable(p->status_va, 4u))
         HLE_MEM32(p->status_va) = XMP_STATUS_PENDING;
+    trace("%08X process %08X %u bytes (%llu ms of sound), %d queued, %s, from 0x%08X",
+          s->iface, p->data, p->size,
+          (unsigned long long)((p->end - p->start) * 1000u / (bytes_per_ms_x1000(s) ? bytes_per_ms_x1000(s) : 1u)),
+          s->count, s->paused ? "paused" : "running", HLE_MEM32(g_esp));
     if (said < 4) {
         said++;
         fprintf(stderr, "[DSOUND] stream %08X: packet %u bytes at %08X (%d queued)\n",
@@ -631,30 +676,60 @@ HLE_EXPORT(CDirectSoundStream_Process)
 
 /* HRESULT CDirectSoundStream::Flush(this). Every pending packet comes back
  * flushed, and the clock moves to the end of the data. */
+static void flush_stream(Stream *s)
+{
+    Packet flushed[MAX_PACKETS];
+    int n = 0, i;
+
+    trace("%08X flush, %d queued", s->iface, s->count);
+    while (s->count > 0) {
+        flushed[n++] = s->packets[s->head];
+        s->head = (s->head + 1) % MAX_PACKETS;
+        s->count--;
+    }
+    s->consumed_base = s->queued;
+    s->resumed_ms = 0u;
+    s->sent = s->queued;
+    recomp_audio_output_reset_voice(slot_of(s));
+    for (i = 0; i < n; i++)
+        complete(s, &flushed[i], XMP_STATUS_FLUSHED, 0u);
+}
+
 HLE_EXPORT(CDirectSoundStream_Flush)
 {
     g_calls_flush++;
     note_caller("Flush");
-    uint64_t now = now_ms();
+    Stream *s;
+
+    lock();
+    s = find_by_object(HLE_ARG(0));
+    if (s)
+        flush_stream(s);
+    unlock();
+    HLE_RETURN(DS_OK);
+}
+
+/* HRESULT CDirectSoundStream::FlushEx(this, REFERENCE_TIME rtTimeStamp,
+ *     DWORD dwFlags)
+ *
+ * TimeSplitters: Future Perfect stops its music with Pause then FlushEx, and
+ * flushes its speech streams this way too. Unreplaced, the packets stayed
+ * queued here: after the next resume the old sound played out first, so a
+ * new piece of music started late by up to three packets (six seconds) and
+ * a line of dialogue could be heard again. A timestamp asks for the flush to
+ * happen later; it is done now, which only cuts the tail early. */
+HLE_EXPORT(CDirectSoundStream_FlushEx)
+{
+    g_calls_flush++;
+    note_caller("FlushEx");
     Stream *s;
 
     lock();
     s = find_by_object(HLE_ARG(0));
     if (s) {
-        Packet flushed[MAX_PACKETS];
-        int n = 0, i;
-        while (s->count > 0) {
-            flushed[n++] = s->packets[s->head];
-            s->head = (s->head + 1) % MAX_PACKETS;
-            s->count--;
-        }
-        s->consumed_base = s->queued;
-        s->resumed_ms = 0u;
-        s->sent = s->queued;
-        recomp_audio_output_reset_voice(slot_of(s));
-        for (i = 0; i < n; i++)
-            complete(s, &flushed[i], XMP_STATUS_FLUSHED, 0u);
-        (void)now;
+        trace("%08X flushex time %08X%08X flags %u", s->iface, HLE_ARG(2), HLE_ARG(1),
+              HLE_ARG(3));
+        flush_stream(s);
     }
     unlock();
     HLE_RETURN(DS_OK);
@@ -695,6 +770,9 @@ HLE_EXPORT(CDirectSoundStream_Pause)
 
     lock();
     s = find_by_object(HLE_ARG(0));
+    if (s)
+        trace("%08X pause(%u) was %s, %d queued, from 0x%08X", s->iface, mode,
+              s->paused ? "paused" : "running", s->count, HLE_MEM32(g_esp));
     if (s) {
         if (mode == DSSTREAMPAUSE_RESUME) {
             if (s->paused) {
@@ -768,6 +846,113 @@ HLE_EXPORT(CDirectSoundStream_SetVolume)
     unlock();
     if (hle_original_CDirectSoundStream_SetVolume) {
         HLE_CALL_ORIGINAL(CDirectSoundStream_SetVolume);
+        return;
+    }
+    HLE_RETURN(DS_OK);
+}
+
+/* HRESULT CDirectSoundStream::SetFrequency(this, DWORD dwFrequency), in Hz;
+ * 0 means the format's own rate.
+ *
+ * A title may create a stream with one format and then retune it: the rate in
+ * the DSSTREAMDESC is only where it starts. Ignoring this played such a stream
+ * at its creation rate -- too fast or too slow, and completing packets on the
+ * same wrong clock, so the title kept feeding it at the wrong speed and nothing
+ * else looked amiss. The new rate drives both the host voice and the clock. */
+HLE_EXPORT(CDirectSoundStream_SetFrequency)
+{
+    uint32_t object = HLE_ARG(0), frequency = HLE_ARG(1);
+    static int said;
+    Stream *s;
+
+    lock();
+    s = find_by_object(object);
+    if (said < 16) {
+        said++;
+        fprintf(stderr, "[DSOUND] stream SetFrequency(%u) on %s (created at %u Hz)\n",
+                frequency, s ? "a modelled stream" : "an unknown object",
+                s ? s->created_rate : 0u);
+    }
+    if (s) {
+        uint32_t rate = frequency ? frequency : s->created_rate;
+        if (rate >= 1000u && rate <= 200000u && rate != s->rate) {
+            uint64_t now = now_ms();
+            pump(s, now);                /* settle the clock at the old rate */
+            s->rate = rate;
+            refeed(s, now);              /* the voice restarts at the new one */
+        }
+    }
+    unlock();
+    if (hle_original_CDirectSoundStream_SetFrequency) {
+        HLE_CALL_ORIGINAL(CDirectSoundStream_SetFrequency);
+        return;
+    }
+    HLE_RETURN(DS_OK);
+}
+
+/* HRESULT CDirectSoundStream::SetFormat(this, LPCWAVEFORMATEX pwfx)
+ *
+ * The format in the DSSTREAMDESC is only the first one. TimeSplitters: Future
+ * Perfect creates one stream at 44.1 kHz and, before each file it plays, reads
+ * that file's WAVEFORMATEX and hands it here: 32 kHz and 22 kHz, mono and
+ * stereo. Ignoring it played every file at 44.1 kHz -- too fast and too high,
+ * and completing packets early, so dialogue ran ahead of its cutscene and was
+ * cut off or repeated when the title fed the next line. */
+HLE_EXPORT(CDirectSoundStream_SetFormat)
+{
+    uint32_t object = HLE_ARG(0), wfx = HLE_ARG(1);
+    static int said;
+    Stream *s;
+
+    lock();
+    s = find_by_object(object);
+    if (s && wfx && guest_readable(wfx, 16u))
+        trace("%08X setformat %08X %u Hz, was %s, %d queued", s->iface, HLE_MEM32(wfx),
+              HLE_MEM32(wfx + 4u), s->paused ? "paused" : "running", s->count);
+    /* The title sets the same format again with packets queued; resetting
+     * the voice for that would cut the sound. */
+    if (s && wfx && guest_readable(wfx, 16u) &&
+        !(HLE_MEM32(wfx) == (s->tag | s->channels << 16) &&
+          HLE_MEM32(wfx + 4u) == s->created_rate &&
+          (HLE_MEM32(wfx + 12u) >> 16) == s->bits)) {
+        uint64_t now = now_ms();
+        uint32_t old_frame = frame_bytes(s), old_tag = s->tag;
+        uint64_t c;
+        int i;
+
+        pump(s, now);
+        c = consumed(s, now);
+        set_format(s, wfx);
+        /* Normally the stream is idle here. If packets are still queued their
+         * positions are in the old format's bytes: lay them out again from
+         * the clock, so the timeline stays in one unit. */
+        if (s->count > 0 && (frame_bytes(s) != old_frame || s->tag != old_tag)) {
+            uint64_t at = c;
+            for (i = 0; i < s->count; i++) {
+                Packet *q = &s->packets[(s->head + i) % MAX_PACKETS];
+                q->start = at;
+                q->end = at + decoded_size(s, q->size);
+                at = q->end;
+            }
+            s->queued = at;
+        } else if (s->count == 0) {
+            s->queued = c;
+        }
+        s->consumed_base = c;
+        if (s->resumed_ms)
+            s->resumed_ms = now;
+        refeed(s, now);
+        if (said < 16) {
+            said++;
+            fprintf(stderr, "[DSOUND] stream %08X SetFormat: tag %04X %u ch %u Hz %u bit, "
+                    "%d packets queued, %s\n", s->iface, s->tag, s->channels, s->rate,
+                    s->bits, s->count, s->output ? "output" : "clock only");
+            fflush(stderr);
+        }
+    }
+    unlock();
+    if (hle_original_CDirectSoundStream_SetFormat) {
+        HLE_CALL_ORIGINAL(CDirectSoundStream_SetFormat);
         return;
     }
     HLE_RETURN(DS_OK);

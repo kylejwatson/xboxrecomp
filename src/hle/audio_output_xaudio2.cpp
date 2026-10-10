@@ -295,6 +295,32 @@ extern "C" int recomp_audio_output_submit(
         owned.capacity = bytes;
     }
     std::memcpy(owned.data, pcm, bytes);
+    /* RECOMP_AUDIO_DUMP=<dir>: append every buffer a voice is given to
+     * <dir>/slotNNN.raw, and its format and first-submit time to slotNNN.txt,
+     * so a sound that plays at the wrong speed can be measured -- seconds of
+     * audio against seconds of wall clock -- instead of guessed at by ear. */
+    {
+        static const char *dir = std::getenv("RECOMP_AUDIO_DUMP");
+        static std::FILE *files[kVoiceCount];
+        if (dir && *dir) {
+            if (!files[slot]) {
+                char path[512];
+                std::snprintf(path, sizeof path, "%s/slot%03u.raw", dir, slot);
+                files[slot] = std::fopen(path, "wb");
+                std::snprintf(path, sizeof path, "%s/slot%03u.txt", dir, slot);
+                if (std::FILE *info = std::fopen(path, "w")) {
+                    std::fprintf(info, "rate %u channels %u bits %u first_tick_ms %lu\n",
+                                 sample_rate, channels, bits_per_sample,
+                                 static_cast<unsigned long>(GetTickCount()));
+                    std::fclose(info);
+                }
+            }
+            if (files[slot]) {
+                std::fwrite(pcm, 1, bytes, files[slot]);
+                std::fflush(files[slot]);
+            }
+        }
+    }
     XAUDIO2_BUFFER buffer{};
     buffer.AudioBytes = bytes;
     buffer.pAudioData = owned.data;
