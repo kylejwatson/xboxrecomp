@@ -179,13 +179,62 @@ on one costs about a millisecond and a title polls several times a frame --
 that was true before this change too, and silently cost more than the game on
 a machine with no pad.
 
-`RECOMP_FAKE_INPUT` and `RECOMP_INPUT_SEQ` are unchanged and apply to
-controller 1 after its bindings. They stand in for a person at the keyboard,
+`RECOMP_FAKE_INPUT` and `RECOMP_INPUT_SEQ` (and `RECOMP_INPUT_REPLAY`, below)
+are unchanged and apply to controller 1 after its bindings. They stand in for a person at the keyboard,
 so what that person bound should not change them.
 
 `src/usb/usb_gamepad.c` reports port 1 through the same bindings, so a title
 that finds its pad through the emulated USB stack rather than the XAPI
 replacement behaves the same.
+
+## The mouse
+
+`src/input/recomp_mouse.c`, fed by raw input on the game window
+(`src/hle/hle_d3d8.c` hands its messages over). Two things:
+
+- **Buttons as sources.** `mouse:left`, `mouse:right`, `mouse:middle`,
+  `mouse:x1`, `mouse:x2`, `mouse:wheel_up`, `mouse:wheel_down` bind to any
+  control like a key. A wheel notch is a 60 ms press and a 40 ms release, so a
+  title acting on the press edge sees every notch.
+- **Mouse look, done in the title.** A mouse cannot be a stick: the title's
+  stick code puts a deadzone, a response curve and an acceleration ramp
+  between the hand and the camera (an earlier version, e00a4eb, tried and was
+  dropped). Instead a title hook takes the raw counts
+  (`recomp_mouse_take_motion`) and adds them straight to its camera angles,
+  `0.022 * sensitivity` degrees per count. A title with such a hook calls
+  `recomp_mouse_title_has_look()` in `main`; only then is the cursor captured
+  (clipped and hidden; F8 releases it, a click on the picture takes it back
+  and is not passed on). TimeSplitters: Future Perfect's hook wraps its
+  look-integration function (`sub_0025D520` in its `recomp_manual.c`).
+
+The file's top-level `"mouse": { "look": true, "sensitivity": 2.5,
+"invert_y": false }` sets the look; `RECOMP_MOUSE=0`, `RECOMP_MOUSE_SENS` and
+`RECOMP_MOUSE_INVERT_Y` override it. `RECOMP_MOUSE=0` stops the capture only:
+scripted movement (below) still reaches the hook, which is what a test run
+wants. The UI (`tools/input_ui`) does not offer mouse sources yet; edit the
+JSON.
+
+## Scripted and recorded input (port 1)
+
+- `RECOMP_INPUT_SEQ=<script>` or `=@<file>`: timed steps
+  `<ms>:<control>[+<control>...][:<hold ms>]`, the clock starting at the
+  title's first pad read. A file may spread steps over lines, with `#`
+  comments. Besides buttons and `lstick_*`/`rstick_*`, `mouse_up`,
+  `mouse_down`, `mouse_left` and `mouse_right` move the mouse while held, at
+  1000 counts a second (`RECOMP_INPUT_SEQ_MOUSE_RATE`), the same total
+  whatever the poll rate.
+- `RECOMP_INPUT_RECORD=<file>`: everything port 1 reads, one line per change
+  (`<ms> <buttons hex> <8 analog bytes> <lx ly rx ry>`), and mouse counts as
+  `<ms> m <dx> <dy>`.
+- `RECOMP_INPUT_REPLAY=<file>`: plays a recording back on the same clock. It
+  replaces the live pad while it lasts and hands it back after its last line,
+  so a recording that ends in a level leaves the player in control. Lifted
+  titles are not deterministic (loading, threads), so menus replay reliably
+  and long stretches of play drift.
+
+There is no save state to restore: a native process with live threads and
+host GPU objects cannot be put back. The route to a place in the game is the
+save state.
 
 ## Tests
 

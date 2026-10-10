@@ -275,6 +275,16 @@ static DWORD WINAPI fps_reporter(LPVOID param)
                     fclose(f);
                     fprintf(stderr, "[FPS]   guest RAM written to %s\n", path);
                 }
+                /* The contiguous window (0x80000000, separate storage at the
+                 * same guest-to-host offset) too: Future Perfect's player
+                 * object is there, and a low-RAM diff never finds it. */
+                snprintf(path, sizeof path, "%s/contig_%.0f.bin", dir, elapsed);
+                f = fopen(path, "wb");
+                if (f) {
+                    fwrite((const void *)((uintptr_t)0x80000000u + g_xbox_mem_offset), 1,
+                           64u * 1024u * 1024u, f);
+                    fclose(f);
+                }
                 at = strchr(at, ',');
                 at = at ? at + 1 : NULL;
             }

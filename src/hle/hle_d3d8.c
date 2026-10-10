@@ -75,6 +75,7 @@
 #include "d3d8_movie.h"
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
+#include "recomp_mouse.h"
 #endif
 
 static void first_call(int *seen, const char *name, uint32_t arg)
@@ -240,6 +241,13 @@ extern void xbox_HostExit(const char *why);
 
 static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    intptr_t answered = 0;
+
+    /* The mouse first (src/input/recomp_mouse.c): raw movement and buttons,
+     * and keeping the cursor on the picture while it is mouse look. It
+     * answers nothing unless the title or the bindings want the mouse. */
+    if (recomp_mouse_window_message(hwnd, msg, (uintptr_t)wp, (intptr_t)lp, &answered))
+        return (LRESULT)answered;
     switch (msg) {
     case WM_CLOSE:
         /* This window is the game's display now, so closing it is the user
@@ -309,7 +317,9 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
     }
     if (!req->hwnd)
         fprintf(stderr, "[HLE-D3D8] shadow: CreateWindow failed (%lu)\n", GetLastError());
-    SetEvent(req->ready);                /* req lives on the waiting caller's stack */
+    else
+        recomp_mouse_attach(req->hwnd);
+    SetEvent(req->ready);               /* req lives on the waiting caller's stack */
     if (!req->hwnd)
         return 1;
 

@@ -366,8 +366,16 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
     if (!on_watched_page(va))
         return 0;
 
-    /* Already stepping on this thread means the step itself faulted on
-     * something else. Do not recurse: put the page back and decline. */
+    /* Already stepping on this thread means the step itself faulted. On a
+     * watched page that is another thread re-protecting it between this
+     * thread's fault and its step (the vblank DPC and the loader thread
+     * both touch Future Perfect's pages): open it again and keep stepping.
+     * Anything else: put the page back and decline. */
+    if (g_step_pending && on_watched_page(va)) {
+        protect_one(va & ~3u, 4, PAGE_READWRITE);
+        ep->ContextRecord->EFlags |= TRAP_FLAG;
+        return 1;
+    }
     if (g_step_pending) {
         protect_one(g_step_va, 4, arm_protection());
         g_step_pending = 0;
@@ -405,12 +413,12 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
                 g_esp, g_eax, g_ecx, g_edx, g_esi, g_edi);
         print_callers();
         print_stack();
-        g_step_before = guest_read32(g_watch[idx].va);
         g_step_va = g_watch[idx].va;
     } else {
         /* Collateral: some other address on the same page. Step over it
-         * silently. */
-        g_step_va = g_watch[0].va;
+         * silently -- on the page that faulted, which is not the first
+         * watch's page when there are several. */
+        g_step_va = va & ~3u;
         g_step_before = 0;
         idx = -1;
     }
@@ -418,6 +426,10 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
     /* Let the access happen, then trap immediately after it so the page can
      * be protected again -- and so the value it wrote can be read. */
     protect_one(g_step_va, 4, PAGE_READWRITE);
+    /* Read only once the page is open: under RECOMP_WATCH_READS it is
+     * no-access, and reading it before would fault inside this handler. */
+    if (idx >= 0)
+        g_step_before = guest_read32(g_watch[idx].va);
     ep->ContextRecord->EFlags |= TRAP_FLAG;
     g_step_pending = idx >= 0 ? 1 : 2;   /* 2 = silent */
     fflush(stderr);
@@ -443,8 +455,10 @@ int xbox_watch_handle_step(PEXCEPTION_POINTERS ep)
         fflush(stderr);
     }
 
+    /* Every watched page, not only the one stepped over: a retried step
+     * (above) may have opened a second one. */
     if (!g_disarmed)
-        protect_one(g_step_va, 4, arm_protection());
+        arm_all();
     (void)g_step_page;
     return 1;
 }

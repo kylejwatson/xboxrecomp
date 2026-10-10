@@ -137,6 +137,19 @@ back to exactly the old behaviour when there is none. `py -3 -m tools.input_ui` 
 that writes it. See `docs/technical/input-binding.md`. `RECOMP_FAKE_INPUT` and
 `RECOMP_INPUT_SEQ` still apply to controller 1 and ignore the bindings.
 
+**Mouse (Oct 2026):** mouse buttons bind as `mouse:left` etc., and *mouse look*
+is a title-side hook, not a fake stick: the hook adds `recomp_mouse_take_motion`
+counts straight to the title's camera angles (`src/input/recomp_mouse.h`, FP's
+in `titles`' `recomp_manual.c` wrapping `sub_0025D520`). `RECOMP_INPUT_SEQ=@file`,
+`mouse_*` script steps, `RECOMP_INPUT_RECORD`/`RECOMP_INPUT_REPLAY` for getting
+back into a level: `docs/technical/input-binding.md`. Two watchpoint fixes from
+that work: several watches no longer re-open the wrong page, and a thread
+whose step is re-protected by another thread retries instead of crashing
+(FP's vblank DPC shares pages with its globals); `RECOMP_WATCH_READS` no longer
+recurses. `RECOMP_RAM_DUMP` also writes the contiguous window as
+`contig_<s>.bin` -- FP's player object lives there, so low RAM alone never
+showed its camera angles.
+
 **Update, 22 Sep 2026 -- TimeSplitters: Future Perfect (XDK 5849) reaches its front end.**
 Five faults sat on top of each other and each needed its own measurement; the
 list, with the tool that found each, is in `docs/technical/shadow-mode.md` ("A frame

@@ -22,6 +22,7 @@
  */
 #include "input_host.h"
 #include "input_bindings.h"
+#include "recomp_mouse.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -47,8 +48,12 @@ enum {
  * a menu but not a place in a level, and "walk to where it looks wrong" is
  * how a rendering bug gets reproduced without a person at the pad. The names
  * match the controls in the binding config (src/input/input_bindings.c). */
-enum { FAKE_BUTTON, FAKE_ANALOG, FAKE_STICK };
+enum { FAKE_BUTTON, FAKE_ANALOG, FAKE_STICK, FAKE_MOUSE };
 enum { STICK_LX, STICK_LY, STICK_RX, STICK_RY };
+/* FAKE_MOUSE: mouse movement while held, at SEQ_MOUSE_RATE counts a second
+ * (RECOMP_INPUT_SEQ_MOUSE_RATE overrides), for a title with a mouse-look hook. */
+enum { MOUSE_DIR_X, MOUSE_DIR_Y };
+#define SEQ_MOUSE_RATE 1000.0
 
 static const struct { const char *name; int kind; unsigned value; int sign; } FAKE[] = {
     { "start", FAKE_BUTTON, XBOX_START, 0 },      { "back",  FAKE_BUTTON, XBOX_BACK, 0 },
@@ -62,6 +67,8 @@ static const struct { const char *name; int kind; unsigned value; int sign; } FA
     { "lstick_left",  FAKE_STICK, STICK_LX, -1 }, { "lstick_right", FAKE_STICK, STICK_LX,  1 },
     { "rstick_up",    FAKE_STICK, STICK_RY,  1 }, { "rstick_down",  FAKE_STICK, STICK_RY, -1 },
     { "rstick_left",  FAKE_STICK, STICK_RX, -1 }, { "rstick_right", FAKE_STICK, STICK_RX,  1 },
+    { "mouse_up",     FAKE_MOUSE, MOUSE_DIR_Y, -1 }, { "mouse_down",  FAKE_MOUSE, MOUSE_DIR_Y,  1 },
+    { "mouse_left",   FAKE_MOUSE, MOUSE_DIR_X, -1 }, { "mouse_right", FAKE_MOUSE, MOUSE_DIR_X,  1 },
 };
 
 /* Name -> FAKE index, or -1. `n` is the name's length inside a longer spec. */
@@ -90,6 +97,8 @@ static void fake_apply(RecompInputGamepad *g, int i)
         default:       g->thumb_ry = push; break;
         }
         break;
+    case FAKE_MOUSE:
+        break;                  /* fed by time in seq_input, not per sample */
     default:
         g->buttons |= (uint16_t)FAKE[i].value;
         break;
@@ -167,15 +176,81 @@ static void seq_parse(const char *env)
     }
 }
 
+/* Milliseconds since the title first read a pad: the clock RECOMP_INPUT_SEQ,
+ * RECOMP_INPUT_RECORD and RECOMP_INPUT_REPLAY all share, so a recording and
+ * a script line up with each other however long the boot took. */
+static unsigned long long input_clock_ms(void)
+{
+    if (!s_seq_t0)
+        s_seq_t0 = GetTickCount64();
+    return GetTickCount64() - s_seq_t0;
+}
+
+/* "@path": the script is in a file, one or more steps a line, '#' starting a
+ * comment. Whitespace is dropped, so the file can be laid out by hand. The
+ * result is the same comma-separated text the variable takes. */
+static char *seq_from_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    char *out, line[1024];
+    size_t cap = 4096, len = 0;
+
+    if (!f) {
+        fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ: cannot open %s\n", path);
+        return NULL;
+    }
+    out = (char *)malloc(cap);
+    if (!out) {
+        fclose(f);
+        return NULL;
+    }
+    out[0] = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *c;
+        for (c = line; *c && *c != '#'; c++) {
+            if (*c == ' ' || *c == '\t' || *c == '\r' || *c == '\n')
+                continue;
+            if (len + 2 >= cap) {
+                char *grown = (char *)realloc(out, cap * 2);
+                if (!grown)
+                    break;
+                out = grown;
+                cap *= 2;
+            }
+            out[len++] = *c;
+        }
+        /* A line ends a step even without its comma. */
+        if (len && out[len - 1] != ',' && len + 2 < cap)
+            out[len++] = ',';
+        out[len] = 0;
+    }
+    fclose(f);
+    while (len && out[len - 1] == ',')
+        out[--len] = 0;
+    return out;
+}
+
 static void seq_input(RecompInputGamepad *g)
 {
+    static unsigned long long prev_t;
+    static double mouse_rate, carry[2];
     unsigned long long t;
     int i, k;
 
     if (s_seq_count < 0) {
         const char *env = getenv("RECOMP_INPUT_SEQ");
+        const char *rate = getenv("RECOMP_INPUT_SEQ_MOUSE_RATE");
         s_seq_count = 0;
-        if (env && *env) {
+        mouse_rate = rate && *rate ? strtod(rate, NULL) : SEQ_MOUSE_RATE;
+        if (env && *env == '@') {
+            char *text = seq_from_file(env + 1);
+            if (text) {
+                seq_parse(text);
+                free(text);
+            }
+            fprintf(stderr, "  [PAD] input script: %d steps from %s\n", s_seq_count, env + 1);
+            fflush(stderr);
+        } else if (env && *env) {
             seq_parse(env);
             fprintf(stderr, "  [PAD] input script: %d steps from %s\n", s_seq_count, env);
             fflush(stderr);
@@ -183,15 +258,188 @@ static void seq_input(RecompInputGamepad *g)
     }
     if (!s_seq_count)
         return;
-    if (!s_seq_t0)
-        s_seq_t0 = GetTickCount64();
-    t = GetTickCount64() - s_seq_t0;
+    t = input_clock_ms();
     for (i = 0; i < s_seq_count; i++) {
-        if (t < s_seq[i].at || t >= (unsigned long long)s_seq[i].at + s_seq[i].hold)
+        unsigned long long end = (unsigned long long)s_seq[i].at + s_seq[i].hold;
+        if (t < s_seq[i].at || prev_t >= end)
             continue;
-        for (k = 0; k < s_seq[i].nkeys; k++)
-            fake_apply(g, s_seq[i].keys[k]);
+        for (k = 0; k < s_seq[i].nkeys; k++) {
+            int f = s_seq[i].keys[k];
+            if (FAKE[f].kind == FAKE_MOUSE) {
+                /* The part of this step's hold that fell since the last
+                 * sample, as counts: the same total however often the
+                 * title polls. */
+                unsigned long long from = prev_t > s_seq[i].at ? prev_t : s_seq[i].at;
+                unsigned long long to = t < end ? t : end;
+                double counts;
+                long whole;
+                if (to <= from)
+                    continue;
+                counts = (double)(to - from) * mouse_rate / 1000.0 * FAKE[f].sign;
+                carry[FAKE[f].value] += counts;
+                whole = (long)carry[FAKE[f].value];
+                carry[FAKE[f].value] -= (double)whole;
+                if (FAKE[f].value == MOUSE_DIR_X)
+                    recomp_mouse_feed_motion(whole, 0);
+                else
+                    recomp_mouse_feed_motion(0, whole);
+            } else if (t < end) {
+                fake_apply(g, f);
+            }
+        }
     }
+    prev_t = t;
+}
+
+/* RECOMP_INPUT_RECORD=<file>: what player 1 does, written as it happens, for
+ * RECOMP_INPUT_REPLAY to play back. The way to get back to a place in the
+ * game without walking there by hand every run: record the menus once (or
+ * the whole route), and replay it.
+ *
+ * One line per change of the pad, "<ms> <buttons> <8 analog bytes> <lx> <ly>
+ * <rx> <ry>", and "<ms> m <dx> <dy>" for mouse movement, on the clock above.
+ * Only port 1, as for the scripts. What is recorded is what the title read,
+ * scripted presses included, so a recording made while a RECOMP_INPUT_SEQ
+ * runs holds both. */
+static FILE *s_rec;
+
+static void record_input(const RecompInputGamepad *g)
+{
+    static int init;
+    static RecompInputGamepad last;
+    static int have_last;
+    unsigned long long t;
+    long dx, dy;
+
+    if (!init) {
+        const char *path = getenv("RECOMP_INPUT_RECORD");
+        init = 1;
+        if (path && *path) {
+            s_rec = fopen(path, "w");
+            if (s_rec) {
+                fprintf(s_rec, "# xboxrecomp input recording v1: <ms> <buttons> "
+                               "<a b x y black white lt rt> <lx ly rx ry> | <ms> m <dx> <dy>\n");
+                recomp_mouse_record_motion(1);
+                fprintf(stderr, "  [PAD] recording player 1's input to %s\n", path);
+            } else {
+                fprintf(stderr, "  [PAD] RECOMP_INPUT_RECORD: cannot write %s\n", path);
+            }
+            fflush(stderr);
+        }
+    }
+    if (!s_rec)
+        return;
+    t = input_clock_ms();
+    if (recomp_mouse_take_recorded(&dx, &dy))
+        fprintf(s_rec, "%llu m %ld %ld\n", t, dx, dy);
+    if (have_last && memcmp(&last, g, sizeof last) == 0)
+        return;
+    last = *g;
+    have_last = 1;
+    fprintf(s_rec, "%llu %04X %u %u %u %u %u %u %u %u %d %d %d %d\n", t, g->buttons,
+            g->analog_buttons[0], g->analog_buttons[1], g->analog_buttons[2],
+            g->analog_buttons[3], g->analog_buttons[4], g->analog_buttons[5],
+            g->analog_buttons[6], g->analog_buttons[7],
+            g->thumb_lx, g->thumb_ly, g->thumb_rx, g->thumb_ry);
+    fflush(s_rec);
+}
+
+/* RECOMP_INPUT_REPLAY=<file>: a RECOMP_INPUT_RECORD file played back on
+ * port 1. While it lasts it replaces the live pad (a replay that a stray key
+ * can push off course is no use); after its last line the live pad is back,
+ * so a replay that ends in a level hands the game over to the player. The
+ * title is not deterministic -- loading times, threads -- so menus replay
+ * reliably and long stretches of play drift; record up to where control is
+ * needed, not beyond. */
+typedef struct { unsigned long long at; int mouse; long dx, dy; RecompInputGamepad g; } ReplayLine;
+static ReplayLine *s_rep;
+static size_t s_rep_count, s_rep_next;
+static RecompInputGamepad s_rep_pad;
+
+static void replay_load(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    char line[256];
+    size_t cap = 0;
+
+    if (!f) {
+        fprintf(stderr, "  [PAD] RECOMP_INPUT_REPLAY: cannot open %s\n", path);
+        return;
+    }
+    while (fgets(line, sizeof line, f)) {
+        ReplayLine r;
+        unsigned b, a[8];
+        int lx, ly, rx, ry, i;
+
+        memset(&r, 0, sizeof r);
+        if (line[0] == '#')
+            continue;
+        if (sscanf(line, "%llu m %ld %ld", &r.at, &r.dx, &r.dy) == 3) {
+            r.mouse = 1;
+        } else if (sscanf(line, "%llu %x %u %u %u %u %u %u %u %u %d %d %d %d", &r.at, &b,
+                          &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6], &a[7],
+                          &lx, &ly, &rx, &ry) == 14) {
+            r.g.buttons = (uint16_t)b;
+            for (i = 0; i < 8; i++)
+                r.g.analog_buttons[i] = (uint8_t)a[i];
+            r.g.thumb_lx = (int16_t)lx;
+            r.g.thumb_ly = (int16_t)ly;
+            r.g.thumb_rx = (int16_t)rx;
+            r.g.thumb_ry = (int16_t)ry;
+        } else {
+            continue;
+        }
+        if (s_rep_count == cap) {
+            ReplayLine *grown;
+            cap = cap ? cap * 2 : 1024;
+            grown = (ReplayLine *)realloc(s_rep, cap * sizeof *s_rep);
+            if (!grown)
+                break;
+            s_rep = grown;
+        }
+        s_rep[s_rep_count++] = r;
+    }
+    fclose(f);
+    fprintf(stderr, "  [PAD] replaying %u input changes from %s (%.1f s)\n",
+            (unsigned)s_rep_count, path,
+            s_rep_count ? (double)s_rep[s_rep_count - 1].at / 1000.0 : 0.0);
+    fflush(stderr);
+}
+
+/* Returns 1 while the replay is running (and *g is its pad). */
+static int replay_input(RecompInputGamepad *g)
+{
+    static int init;
+    unsigned long long t;
+
+    if (!init) {
+        const char *path = getenv("RECOMP_INPUT_REPLAY");
+        init = 1;
+        if (path && *path)
+            replay_load(path);
+    }
+    if (!s_rep_count)
+        return 0;
+    t = input_clock_ms();
+    while (s_rep_next < s_rep_count && s_rep[s_rep_next].at <= t) {
+        const ReplayLine *r = &s_rep[s_rep_next++];
+        if (r->mouse)
+            recomp_mouse_feed_motion(r->dx, r->dy);
+        else
+            s_rep_pad = r->g;
+    }
+    if (s_rep_next >= s_rep_count) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [PAD] replay finished at %.1f s: the pad is live\n",
+                    (double)t / 1000.0);
+            fflush(stderr);
+        }
+        return 0;
+    }
+    *g = s_rep_pad;
+    return 1;
 }
 
 static void fake_input(RecompInputGamepad *g)
@@ -261,8 +509,10 @@ bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad)
         gamepad->thumb_ry = (int16_t)pad.sThumbRY;
     }
     if (port == 0) {
+        replay_input(gamepad);
         fake_input(gamepad);
         seq_input(gamepad);
+        record_input(gamepad);
     }
     return true;
 }
