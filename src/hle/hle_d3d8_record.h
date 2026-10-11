@@ -94,6 +94,9 @@ void hle_d3d8_fb_before_write(void);
 /* That kept picture, for a frame buffer (physical address) the host back
  * buffer no longer holds; NULL when it does hold it, or nothing was kept. */
 IDirect3DTexture8 *hle_d3d8_fb_kept(uint32_t phys);
+/* The host size of a frame-buffer texture the guest made w x h: scaled
+ * like the scene, so supersampling survives a title sampling its frame. */
+void hle_d3d8_fb_host_size(UINT w, UINT h, UINT *host_w, UINT *host_h);
 /* Counts draws and clears into a frame buffer; a copy of it taken at an
  * older count is out of date. */
 unsigned long hle_d3d8_fb_generation(void);

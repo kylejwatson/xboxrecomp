@@ -151,7 +151,9 @@ static void row_value(const Row *r, char *out, size_t n)
         snprintf(out, n, "%s", *r->ival ? "On" : "Off");
         break;
     case ROW_INT:
-        if (r->ival == &g_settings.resolution_scale)
+        if (r->ival == &g_settings.resolution_scale && *r->ival > 8)
+            snprintf(out, n, "%dp (from the file)", *r->ival);   /* a height */
+        else if (r->ival == &g_settings.resolution_scale)
             snprintf(out, n, *r->ival == 1 ? "Console (640x480)" : "%dx (%dx%d)",
                      *r->ival, 640 * *r->ival, 480 * *r->ival);
         else if (*r->ival == 1)

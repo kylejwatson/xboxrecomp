@@ -526,7 +526,12 @@ void hle_d3d8_fb_before_write(void)
     if (i == 4)
         return;
     if (!g_fb_kept[i].tex) {
-        if (FAILED(host_CreateTexture(g_shadow, g_shadow_width, g_shadow_height, 1,
+        UINT kw, kh;
+
+        /* The size framebuffer_texture makes a screen-sized one, so the
+         * kept picture copies straight into it. */
+        hle_d3d8_fb_host_size(g_shadow_width, g_shadow_height, &kw, &kh);
+        if (FAILED(host_CreateTexture(g_shadow, kw, kh, 1,
                                       D3DUSAGE_RENDERTARGET, D3DFMT_LIN_A8R8G8B8,
                                       D3DPOOL_DEFAULT, &g_fb_kept[i].tex)) ||
             !g_fb_kept[i].tex) {
@@ -540,6 +545,23 @@ void hle_d3d8_fb_before_write(void)
         fflush(stderr);
     }
     g_fb_kept[i].valid = SUCCEEDED(xbox_D3D8CopyBackBufferToTexture(g_fb_kept[i].tex));
+}
+
+void hle_d3d8_fb_host_size(UINT w, UINT h, UINT *host_w, UINT *host_h)
+{
+    UINT sw = 0, sh = 0;
+
+    *host_w = w;
+    *host_h = h;
+    if (!g_shadow_width || !g_shadow_height)
+        return;
+    xbox_D3D8GetSceneSize(&sw, &sh);
+    if (!sw || !sh || (sw == g_shadow_width && sh == g_shadow_height))
+        return;
+    *host_w = (UINT)(((uint64_t)w * sw + g_shadow_width / 2) / g_shadow_width);
+    *host_h = (UINT)(((uint64_t)h * sh + g_shadow_height / 2) / g_shadow_height);
+    if (!*host_w) *host_w = 1;
+    if (!*host_h) *host_h = 1;
 }
 
 IDirect3DTexture8 *hle_d3d8_fb_kept(uint32_t phys)
@@ -649,7 +671,12 @@ static void shadow_create(uint32_t pp_va)
     if (pp_va && HLE_MEM32(pp_va + 32))
         g_z_scale = xbox_depth_z_scale(HLE_MEM32(pp_va + 36));
 
-    hwnd = shadow_window(width, height);
+    {
+        UINT ww, wh;
+
+        xbox_D3D8WindowSize(width, height, &ww, &wh);
+        hwnd = shadow_window(ww, wh);
+    }
     g_shadow_hwnd = hwnd;
     if (!hwnd)
         return;

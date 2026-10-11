@@ -211,8 +211,17 @@ int recomp_settings_read(const char *path, RecompSettings *s)
     {
         const char *v;
 
-        if ((v = from_table("resolution_scale")) != NULL)
-            s->resolution_scale = clamp_int(atoi(v), 1, 8);
+        if ((v = from_table("resolution_scale")) != NULL) {
+            /* A multiple (1..8) or a height in lines (240..4320, also
+             * "1080p", "4k"); see d3d8_display.c. */
+            int n = atoi(v);
+
+            if (!strcmp(v, "4k") || !strcmp(v, "4K") || !strcmp(v, "uhd") || !strcmp(v, "UHD"))
+                n = 2160;
+            else if (!strcmp(v, "hd") || !strcmp(v, "HD"))
+                n = 720;
+            s->resolution_scale = n > 8 ? clamp_int(n, 240, 4320) : clamp_int(n, 1, 8);
+        }
         if ((v = from_table("widescreen")) != NULL)
             s->widescreen = !off_word(v);
         if ((v = from_table("hor_plus")) != NULL)
@@ -282,8 +291,10 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# Delete this file to go back to the defaults.\n"
         "\n"
         "# How much larger than the console the game is rendered, before being\n"
-        "# filtered back down: supersampling. 1 is the console's own size. 2 is\n"
-        "# a good default and costs little. Up to 8.        [RECOMP_RES_SCALE]\n"
+        "# filtered to the window: 1 is the console's own size, 2 to 8 are\n"
+        "# multiples of it. Or a height in lines -- 720, 1080, 1440, 2160 (or\n"
+        "# 1080p, 4k) -- rendered at the output's shape, so 1080 with\n"
+        "# widescreen is 1920x1080.                         [RECOMP_RES_SCALE]\n"
         "resolution_scale = %d\n"
         "\n"
         "# Present at 16:9 rather than 4:3, and tell the game the console is\n"

@@ -1770,9 +1770,18 @@ BOOL d3d8_base_size(IDirect3DBaseTexture8 *texture, UINT *width, UINT *height)
     if (!texture || IDirect3DBaseTexture8_GetType(texture) != D3DRTYPE_TEXTURE)
         return FALSE;
     t = (D3D8Texture *)texture;
-    if (width)  *width = t->width;
-    if (height) *height = t->height;
+    if (width)  *width = t->texel_width ? t->texel_width : t->width;
+    if (height) *height = t->texel_height ? t->texel_height : t->height;
     return TRUE;
+}
+
+void xbox_D3D8SetTextureTexelSize(IDirect3DTexture8 *texture, UINT width, UINT height)
+{
+    D3D8Texture *t = (D3D8Texture *)texture;
+
+    if (!t) return;
+    t->texel_width = width;
+    t->texel_height = height;
 }
 
 D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture)

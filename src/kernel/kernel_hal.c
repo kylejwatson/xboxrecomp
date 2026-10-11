@@ -823,8 +823,17 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          * NTSC-M here while the EEPROM said PAL for a PAL-only disc, and XGRA
          * asked for the 640x576 PAL mode it read from one and D3D rejected it
          * against the other: CreateDevice returned E_FAIL and the title ran
-         * with no device. */
-        *Result = AV_PACK_HDTV | xbox_kernel_console_av_standard();
+         * with no device.
+         *
+         * The real kernel ORs the EEPROM's XC_VIDEO flags into this word,
+         * and D3D's mode search reads them from here, not from XC_VIDEO:
+         * a device asked for with D3DPRESENTFLAG_WIDESCREEN is refused
+         * unless 0x10000 (XC_VIDEO_FLAGS_WIDESCREEN, raw) is set
+         * (Future Perfect's CreateDevice failed with E_FAIL until it was;
+         * the PAL60 bit above is the same thing for the refresh). */
+        *Result = AV_PACK_HDTV | xbox_kernel_console_av_standard()
+                | (recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0)
+                       ? XC_VIDEO_RAW(XC_VIDEO_FLAGS_WIDESCREEN) : 0);
         break;
 
     case AV_OPTION_QUERY_MODE:

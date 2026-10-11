@@ -315,6 +315,19 @@ static void handle_event(const SDL_Event *e)
     case SDL_KEYUP:
         if (e->key.repeat)
             break;
+        /* Alt+Enter: borderless fullscreen on the window's display and back.
+         * The scene is fitted to whatever size the window becomes, so this
+         * is how a 1080p or 4K render is seen at its own size. Kept from the
+         * title, which would take Enter as Start. */
+        if (e->key.keysym.scancode == SDL_SCANCODE_RETURN &&
+            (e->key.keysym.mod & KMOD_ALT)) {
+            if (e->type == SDL_KEYDOWN && s_window) {
+                Uint32 fs = SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN_DESKTOP;
+
+                SDL_SetWindowFullscreen(s_window, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+            }
+            break;
+        }
         vk = vk_from_scancode(e->key.keysym.scancode);
         vk_change(vk, e->type == SDL_KEYDOWN);
         vk_change(vk_generic(vk), e->type == SDL_KEYDOWN);

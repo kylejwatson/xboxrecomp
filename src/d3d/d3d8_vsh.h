@@ -148,6 +148,8 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle);
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
 /* Which constant register the experimental Hor+ scale applies to. */
 int  d3d8_vsh_hor_plus_reg(void);
+/* The Hor+ widening factor in force (RECOMP_HOR_PLUS); 1.0 when none. */
+float d3d8_vsh_hor_plus(void);
 
 /**
  * The whole constant bank, as NV2A_VS_MAX_CONSTANTS float4 registers laid out

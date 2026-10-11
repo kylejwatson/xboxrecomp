@@ -63,7 +63,7 @@ const char *recomp_config_path(void);
  * through the lookups above -- that keeps the environment override
  * visible where each setting is used -- but the file's shape is here. */
 typedef struct RecompSettings {
-    int  resolution_scale;      /* 1..8 */
+    int  resolution_scale;      /* 1..8 a multiple, 240..4320 a height in lines */
     int  widescreen;            /* 0 or 1 */
     double hor_plus;            /* 0 leaves the camera alone; 0.75 is 4:3->16:9 */
     int  hor_plus_register;     /* per title; 60 for TimeSplitters 2 */

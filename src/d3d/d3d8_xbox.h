@@ -1171,6 +1171,18 @@ void xbox_D3D8SetPresentInterval(UINT interval);
 /* The size the guest presents at, for its screen-space geometry; the HLE
  * sets it from the title's present parameters (d3d8_GetGuestWidth). */
 void xbox_D3D8SetGuestSize(UINT width, UINT height);
+/* The size the host actually renders the screen at: the guest size scaled
+ * by the display policy (RECOMP_RES_SCALE, RECOMP_WIDESCREEN). */
+void xbox_D3D8GetSceneSize(UINT *width, UINT *height);
+/* The size to open the window at for a guest presenting at guest_w x
+ * guest_h: the guest's own when nothing is scaled, else 720 lines at the
+ * output's shape (1280x720 in widescreen). The window can be resized or
+ * made fullscreen afterwards; the picture is fitted to it at present. */
+void xbox_D3D8WindowSize(UINT guest_w, UINT guest_h, UINT *width, UINT *height);
+/* For a texture made bigger than the guest's (one standing for the screen,
+ * made at the scene size): the guest size, which linear-format texel
+ * coordinates are measured against. */
+void xbox_D3D8SetTextureTexelSize(IDirect3DTexture8 *texture, UINT width, UINT height);
 
 /* The Xbox's D3DDevice_SetScissors: clip drawing to the rectangles (or, with
  * exclusive set, outside them); count 0 turns it off. The host applies one

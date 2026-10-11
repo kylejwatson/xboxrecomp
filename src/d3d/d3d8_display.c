@@ -26,6 +26,38 @@
  * Policy
  * ================================================================ */
 
+/* RECOMP_RES_SCALE: a whole multiple of the guest's size (1..8), or the
+ * height to render at -- "1080p", "1440", "4k". A height gives the scene
+ * that many lines whatever the guest's own size; the width follows the
+ * output shape. */
+static int parse_resolution(const char *v, UINT *scale, UINT *target_height)
+{
+    char *endp = NULL;
+    long n;
+
+    if (!strcmp(v, "4k") || !strcmp(v, "4K") || !strcmp(v, "uhd") || !strcmp(v, "UHD")) {
+        *target_height = 2160;
+        return 1;
+    }
+    if (!strcmp(v, "hd") || !strcmp(v, "HD")) {
+        *target_height = 720;
+        return 1;
+    }
+    n = strtol(v, &endp, 10);
+    if (endp == v)
+        return 0;
+    if (*endp == 'p' || *endp == 'P') {
+        endp++;
+    } else if (!*endp && n >= 1 && n <= D3D8_DISPLAY_MAX_SCALE) {
+        *scale = (UINT)n;
+        return 1;
+    }
+    if (*endp || n < 240 || n > 4320)
+        return 0;
+    *target_height = (UINT)n;
+    return 1;
+}
+
 static D3D8DisplayPolicy g_policy;
 static int               g_policy_read;
 
@@ -33,22 +65,18 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
 {
     if (!g_policy_read) {
         const char *v = recomp_config_lookup("RECOMP_RES_SCALE", "resolution_scale");
-        long n = 1;
-
 
         g_policy_read = 1;
         g_policy.scale = 1;
+        g_policy.target_height = 0;
 
-        if (v && *v) {
-            char *endp = NULL;
-            n = strtol(v, &endp, 10);
-            if (endp == v || (endp && *endp) || n < 1 || n > D3D8_DISPLAY_MAX_SCALE) {
-                fprintf(stderr, "D3D8 display: RECOMP_RES_SCALE=%s is not a whole "
-                        "number from 1 to %d; rendering at the guest's own size\n",
-                        v, D3D8_DISPLAY_MAX_SCALE);
-                n = 1;
-            }
-            g_policy.scale = (UINT)n;
+        if (v && *v && !parse_resolution(v, &g_policy.scale, &g_policy.target_height)) {
+            fprintf(stderr, "D3D8 display: RECOMP_RES_SCALE=%s is neither a whole "
+                    "number from 1 to %d nor a height (720p, 1080p, 1440p, 4k, "
+                    "<n>p); rendering at the guest's own size\n",
+                    v, D3D8_DISPLAY_MAX_SCALE);
+            g_policy.scale = 1;
+            g_policy.target_height = 0;
         }
 
         g_policy.anisotropy = 1;
@@ -64,10 +92,13 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
             g_policy.anisotropy = (UINT)a;
         }
 
-        if (g_policy.scale > 1)
+        g_policy.widescreen = recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0);
+        if (g_policy.target_height)
+            fprintf(stderr, "D3D8 display: rendering %u lines high, filtered to the "
+                    "window at present\n", g_policy.target_height);
+        else if (g_policy.scale > 1)
             fprintf(stderr, "D3D8 display: supersampling %ux, box filtered at present\n",
                     g_policy.scale);
-        g_policy.widescreen = recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0);
 
         if (g_policy.widescreen)
             fprintf(stderr, "D3D8 display: widescreen, so the title's frame is presented "
@@ -84,27 +115,54 @@ void d3d8_display_scene_size(UINT guest_w, UINT guest_h,
                              UINT *scene_w, UINT *scene_h)
 {
     const D3D8DisplayPolicy *p = d3d8_display_policy();
+    UINT h = p->target_height ? p->target_height : guest_h * p->scale;
+    UINT w = guest_w * p->scale;
 
-    if (scene_w) *scene_w = guest_w * p->scale;
-    if (scene_h) *scene_h = guest_h * p->scale;
+    /* Wider than the guest's own shape when the target is a height or the
+     * output is 16:9: every guest-to-host conversion has a factor per axis
+     * (rt_scale_x/y, the screen copy, the clear rectangles), and the draw
+     * paths end in normalised coordinates, so a 640x480 title re-rasterises
+     * at 1920x1080 as readily as at 1280x960. That is what keeps pixels
+     * square in widescreen -- an anamorphic 4:3 scene stretched at present
+     * would throw away a quarter of the horizontal resolution. Unscaled 4:3
+     * stays exactly the guest's size. */
+    if (guest_h && (p->target_height || p->widescreen)) {
+        uint64_t aw = p->widescreen ? 16 : guest_w, ah = p->widescreen ? 9 : guest_h;
+
+        w = (UINT)(((uint64_t)h * aw + ah / 2) / ah);
+        w = (w + 1) & ~1u;              /* even, so the centre is a pixel edge */
+    }
+    if (scene_w) *scene_w = w ? w : guest_w;
+    if (scene_h) *scene_h = h ? h : guest_h;
+}
+
+void xbox_D3D8WindowSize(UINT guest_w, UINT guest_h, UINT *width, UINT *height)
+{
+    UINT sw, sh;
+
+    d3d8_display_scene_size(guest_w, guest_h, &sw, &sh);
+    *width = sw;
+    *height = sh;
+    /* Bigger than the console asked for only when the scene is, and then
+     * no taller than 720 lines, which fits any desktop with room for the
+     * window's frame; a 4K scene in a 2160-line window would not. */
+    if (sh > guest_h && guest_h) {
+        UINT h = sh < 720 ? sh : 720;
+
+        if (h < guest_h)
+            h = guest_h;
+        *width = (UINT)(((uint64_t)sw * h + sh / 2) / sh);
+        *height = h;
+    }
 }
 
 void d3d8_display_output_shape(UINT scene_w, UINT scene_h,
                                UINT *shape_w, UINT *shape_h)
 {
-    const D3D8DisplayPolicy *p = d3d8_display_policy();
-
-    if (p->widescreen) {
-        /* The frame is anamorphic: the title squeezed a 16:9 view into
-         * whatever buffer it renders to, and the display is meant to
-         * stretch it back. Presenting it at its own shape would be the
-         * squeeze left in. */
-        if (shape_w) *shape_w = 16;
-        if (shape_h) *shape_h = 9;
-    } else {
-        if (shape_w) *shape_w = scene_w;
-        if (shape_h) *shape_h = scene_h;
-    }
+    /* The scene is built at the shape it is to be seen at (above), 16:9
+     * included, so presenting it at its own shape is right. */
+    if (shape_w) *shape_w = scene_w;
+    if (shape_h) *shape_h = scene_h;
 }
 
 D3D8DisplayFit d3d8_display_fit(UINT shape_w, UINT shape_h, UINT bb_w, UINT bb_h)

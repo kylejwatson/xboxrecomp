@@ -125,10 +125,14 @@ position` line before suspecting anything else.
 
 **Widescreen and internal resolution** are investigated in
 `docs/technical/widescreen-and-resolution.md`, with every work item classified toolkit or
-game-specific. Two things to know before touching either: `XGetVideoFlags` returns 0 today
-because the kernel puts the video flags in the low half-word and XAPI reads the high one, and
-Xbox widescreen is anamorphic, so a title that has a 16:9 mode needs no stretching anywhere
-while a title that has none (TimeSplitters 2) cannot be given one natively.
+game-specific. Xbox widescreen is anamorphic, so a title that has a 16:9 mode needs no
+stretching anywhere while a title that has none (TimeSplitters 2) cannot be given one
+natively. **Oct 2026 (Future Perfect):** `RECOMP_RES_SCALE` also takes a height (`1080p`,
+`4k`) and the scene is built at the output shape with square pixels (1920x1080 in
+widescreen), frame-buffer textures are made at the scene size (`hle_d3d8_fb_host_size`,
+texel size kept as the guest's), the 2D squeeze applies only under Hor+, and
+`AV_OPTION_QUERY_AVPACK` carries the widescreen bit, without which D3D refuses a
+`D3DPRESENTFLAG_WIDESCREEN` device.
 
 **Input is bound, not hard-coded (Sep 2026):** all four ports read
 `src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else

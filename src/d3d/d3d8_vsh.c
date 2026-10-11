@@ -1420,6 +1420,11 @@ static float hor_plus_factor(void)
     return factor;
 }
 
+float d3d8_vsh_hor_plus(void)
+{
+    return hor_plus_factor();
+}
+
 float xbox_D3D8ClaimHorPlus(void)
 {
     float factor = hor_plus_factor();

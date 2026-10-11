@@ -163,6 +163,11 @@ typedef struct D3D8Texture {
     BOOL                    locked;
     BOOL                    dirty;
     UINT                    palette;    /* Palette index (texture stage) this P8 texture bakes */
+    /* The size a linear texture's texel coordinates are measured against,
+     * when the host texture is bigger than the guest's (a frame-buffer
+     * texture made at the scaled scene size); 0 means width/height. */
+    UINT                    texel_width;
+    UINT                    texel_height;
 } D3D8Texture;
 
 typedef struct D3D8Surface {

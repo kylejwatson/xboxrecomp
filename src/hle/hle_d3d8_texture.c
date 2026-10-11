@@ -438,22 +438,33 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
         }
     }
     if (!e) {
+        UINT host_w, host_h;
+
         e = cache_slot(dev, now);
         if (!e)
             return NULL;
-        if (FAILED(host_CreateTexture(dev, t->width, t->height, 1, D3DUSAGE_RENDERTARGET,
+        /* At the scene's size when the host renders larger than the guest:
+         * a title that grades its whole frame through this texture (Future
+         * Perfect, every frame) would otherwise put a 640x480 picture on
+         * screen whatever the resolution. Texel coordinates stay the
+         * guest's. */
+        hle_d3d8_fb_host_size(t->width, t->height, &host_w, &host_h);
+        if (FAILED(host_CreateTexture(dev, host_w, host_h, 1, D3DUSAGE_RENDERTARGET,
                                       (D3DFORMAT)t->fmt, D3DPOOL_DEFAULT, &e->host)) ||
             !e->host) {
             memset(e, 0, sizeof *e);
             g_skip_create++;
             return NULL;
         }
+        if (host_w != t->width || host_h != t->height)
+            xbox_D3D8SetTextureTexelSize(e->host, t->width, t->height);
         e->va = va;
         e->rendered = 1;
         e->framebuffer = 1;
         fprintf(stderr, "[HLE-D3D8] the title binds its own frame as a texture "
                 "0x%08X (%ux%u, format 0x%02X, data 0x%08X); filling it from the "
-                "host's frame\n", va, t->width, t->height, t->fmt, data);
+                "host's frame at %ux%u\n", va, t->width, t->height, t->fmt, data,
+                host_w, host_h);
         fflush(stderr);
     }
     e->data = data;

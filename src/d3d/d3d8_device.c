@@ -17,6 +17,7 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_display.h"
+#include "d3d8_vsh.h"
 #include <stdio.h>
 #include <string.h>
 /* malloc: without <stdlib.h> its pointer is truncated to int. */
@@ -199,6 +200,14 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height)
  * that never set a guest size wants the smaller of the two -- dividing a
  * screen-space quad by the scene size would shrink it. */
 UINT d3d8_GetGuestWidth(void)  { return g_guest_width  ? g_guest_width  : g_device_state.present_width; }
+
+/* The host's scene target, for a caller outside src/d3d that makes a
+ * texture standing for the screen (the HLE's frame-buffer textures). */
+void xbox_D3D8GetSceneSize(UINT *width, UINT *height)
+{
+    if (width)  *width = g_device_state.width;
+    if (height) *height = g_device_state.height;
+}
 
 ID3D11ShaderResourceView *d3d8_GetSceneSRV(void) { return g_device_state.scene_srv; }
 ID3D11Texture2D *d3d8_GetSceneTexture(void) { return g_device_state.scene_texture; }
@@ -1653,9 +1662,10 @@ static void apply_host_viewport(void)
      * back: a HUD laid out for 4:3 keeps its proportions and sits in the
      * centre. Nothing is resampled twice -- the squeeze is a viewport, so
      * the draw is simply rasterised narrower. */
-    if (g_2d_squeeze && g_device_state.height && !g_cur_rt) {
-        float k = ((float)g_device_state.width * 9.0f) /
-                  ((float)g_device_state.height * 16.0f);
+    if (g_2d_squeeze && g_device_state.width && g_device_state.present_height && !g_cur_rt) {
+        /* The guest's shape over the scene's: 0.75 for 4:3 in 16:9. */
+        float k = ((float)g_device_state.present_width * (float)g_device_state.height) /
+                  ((float)g_device_state.present_height * (float)g_device_state.width);
 
         if (k > 0.0f && k < 1.0f) {
             float cx = (float)g_device_state.width * 0.5f;
@@ -1673,7 +1683,12 @@ static void apply_host_viewport(void)
  * frame is a run of 3D draws and then a run of 2D ones. */
 void d3d8_SetTwoDSqueeze(BOOL on)
 {
-    if (!d3d8_display_policy()->widescreen)
+    /* Only for a 4:3 title widened by Hor+, whose 2D layer is still laid
+     * out for 4:3. A title with a 16:9 mode of its own (Burnout 2, Future
+     * Perfect) authors its 2D layer for the wide screen already, and
+     * squeezing it put Future Perfect's whole graded frame -- a
+     * full-screen pass from a vertex program -- in a 4:3 box. */
+    if (!d3d8_display_policy()->widescreen || d3d8_vsh_hor_plus() == 1.0f)
         on = FALSE;
     if (g_2d_squeeze == (on ? TRUE : FALSE))
         return;
