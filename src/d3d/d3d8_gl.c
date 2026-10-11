@@ -1090,6 +1090,22 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
     return E_NOTIMPL;
 }
 
+HRESULT xbox_D3D8CopyBackBufferRectToTexture(IDirect3DTexture8 *dst,
+                                             int src_x, int src_y, int w, int h,
+                                             int dst_x, int dst_y,
+                                             UINT dst_w, UINT dst_h)
+{
+    (void)dst; (void)src_x; (void)src_y; (void)w; (void)h;
+    (void)dst_x; (void)dst_y; (void)dst_w; (void)dst_h;
+    return E_NOTIMPL;
+}
+
+HRESULT xbox_D3D8CopyTexture(IDirect3DTexture8 *dst, IDirect3DTexture8 *src)
+{
+    (void)dst; (void)src;
+    return E_NOTIMPL;
+}
+
 unsigned long xbox_D3D8ScreenCopyCount(void) { return 0; }
 void xbox_D3D8ScreenCopyShutdown(void) {}
 

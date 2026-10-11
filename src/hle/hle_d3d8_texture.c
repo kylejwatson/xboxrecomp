@@ -84,6 +84,7 @@ typedef struct {
     /* The texels are the frame buffer's, so the content comes from the
      * host's finished frame and is refreshed every frame it is bound. */
     int                framebuffer;
+    unsigned long      fb_gen;       /* hle_d3d8_fb_generation() at the last copy */
     /* P8: the host texture holds the texels expanded through a palette, and
      * this is the checksum of that palette (0: not known, bake again). */
     int                p8;
@@ -460,9 +461,28 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
     e->size = size;
     e->used_swap = now;
     /* Once per frame: the picture it should hold is this frame's, so far. */
-    if (e->checked_swap != now) {
+    /* Again whenever anything has been drawn into the frame buffer since the
+     * last copy, not once a frame: the console samples the memory as it is at
+     * the draw. Future Perfect's uplink shimmer first binds the frame in the
+     * middle of building its map in the screen's corner; with one copy a
+     * frame, the full-screen passes after the world sampled that copy and
+     * put the map corner back on screen. RECOMP_HLE_D3D8_FB_COPY_ONCE=1 is
+     * the old once-a-frame copy. */
+    static int once = -1;
+    unsigned long gen = hle_d3d8_fb_generation();
+
+    if (once < 0)
+        once = xbox_EnvSwitch("RECOMP_HLE_D3D8_FB_COPY_ONCE", 0);
+    if (e->checked_swap != now || (!once && e->fb_gen != gen)) {
+        /* The host's back buffer may hold the title's other frame buffer by
+         * now; then this one's picture is the copy kept when drawing left it
+         * (hle_d3d8_fb_before_write). */
+        IDirect3DTexture8 *kept = hle_d3d8_fb_kept(data & 0x0FFFFFFFu);
+
         e->checked_swap = now;
-        xbox_D3D8CopyBackBufferToTexture(e->host);
+        e->fb_gen = gen;
+        if (!kept || FAILED(xbox_D3D8CopyTexture(e->host, kept)))
+            xbox_D3D8CopyBackBufferToTexture(e->host);
         framebuffer_probe(e, now);
     }
     return e->host;

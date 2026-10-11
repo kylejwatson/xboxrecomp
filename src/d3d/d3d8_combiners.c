@@ -200,8 +200,8 @@ static void parse_four_inputs(DWORD dword, NV2ACombinerInput inputs[4])
  *   [13]    AB dot product flag         (AB_DOT_PRODUCT 0x02)
  *   [14]    mux instead of sum          (AB_CD_MUX 0x04)
  *   [17:15] output mapping (scale/bias) (OUTPUTMAPPING_* 0x08-0x38)
- *   [18]    CD blue to alpha            (CD_BLUE_TO_ALPHA 0x40) - not handled
- *   [19]    AB blue to alpha            (AB_BLUE_TO_ALPHA 0x80) - not handled
+ *   [18]    CD blue to alpha            (CD_BLUE_TO_ALPHA 0x40)
+ *   [19]    AB blue to alpha            (AB_BLUE_TO_ALPHA 0x80)
  */
 static void parse_output(DWORD dword, NV2ACombinerOutput *output)
 {
@@ -216,6 +216,8 @@ static void parse_output(DWORD dword, NV2ACombinerOutput *output)
     output->ab_dot     = (dword >> 13) & 1;
     output->mux_sum    = (dword >> 14) & 1;
     output->output_map = (NV2AOutputMapping)((dword >> 15) & 0x7);
+    output->cd_blue_to_alpha = (dword >> 18) & 1;
+    output->ab_blue_to_alpha = (dword >> 19) & 1;
 }
 
 /* ================================================================
@@ -277,9 +279,11 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
      *
      * D3DRS_PSCOMBINERCOUNT layout:
      *   [3:0] number of stages
-     *   [8]   unique C0 per stage (1) vs shared (0)
-     *   [9]   unique C1 per stage (1) vs shared (0)
-     *   [16]  mux_MSB for final combiner (not commonly used)
+     *   [8]   mux on r0.a's MSB rather than its LSB
+     *   [12]  unique C0 per stage (1) vs stage 0's for all (0)
+     *   [16]  unique C1 per stage (1) vs stage 0's for all (0)
+     * (XDK PS_COMBINERCOUNT(count, flags) = flags << 8 | count, with
+     * MUX_MSB 0x001, UNIQUE_C0 0x010, UNIQUE_C1 0x100.)
      */
     if (state->num_stages == 0) {
         state->num_stages = rs[D3DRS_PSCOMBINERCOUNT] & 0xF;
@@ -369,11 +373,26 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
         state->c1[i] = rs[D3DRS_PSCONSTANT1_0 + i];
     }
 
-    /* Final combiner uses the constants from the last active stage, or
-     * can use its own - for now, store them separately. Games typically
-     * share them with the last stage. */
-    state->final_c0 = state->c0[state->num_stages > 0 ? state->num_stages - 1 : 0];
-    state->final_c1 = state->c1[state->num_stages > 0 ? state->num_stages - 1 : 0];
+    /* Without UNIQUE_C0/UNIQUE_C1 every stage reads stage 0's constant.
+     * Generating c0[i] regardless gave such a shader zeros (or stale
+     * values) in its later stages. */
+    {
+        DWORD count_flags = rs[D3DRS_PSCOMBINERCOUNT] >> 8;
+
+        for (i = 1; i < NV2A_MAX_COMBINER_STAGES; i++) {
+            if (!(count_flags & 0x010))
+                state->c0[i] = state->c0[0];
+            if (!(count_flags & 0x100))
+                state->c1[i] = state->c1[0];
+        }
+    }
+
+    /* The final combiner has constants of its own, not the last stage's.
+     * Future Perfect's uplink map shimmer lerps between two channel shuffles
+     * by its final C0 (a blue mask); reading the last stage's constant
+     * instead painted the hologram a solid blue square. */
+    state->final_c0 = rs[D3DRS_PSFINALCOMBINERCONSTANT0];
+    state->final_c1 = rs[D3DRS_PSFINALCOMBINERCONSTANT1];
 
     /* Read texture modes from render state if not already set by token */
     if (state->tex_mode[0] == 0 && state->tex_mode[1] == 0 &&
@@ -472,11 +491,18 @@ static void emit_mapped_input(char *buf, int bufsize, int *off,
 
     rn = reg_name(input->reg);
 
-    /* For per-stage C0/C1, use the stage-indexed constant */
+    /* For per-stage C0/C1, use the stage-indexed constant; stage -1 is the
+     * final combiner, whose constants are its own (fc0/fc1). */
     if (input->reg == NV2A_REG_C0) {
-        snprintf(base_expr, sizeof(base_expr), "c0[%d]", stage_idx);
+        if (stage_idx < 0)
+            snprintf(base_expr, sizeof(base_expr), "fc0");
+        else
+            snprintf(base_expr, sizeof(base_expr), "c0[%d]", stage_idx);
     } else if (input->reg == NV2A_REG_C1) {
-        snprintf(base_expr, sizeof(base_expr), "c1[%d]", stage_idx);
+        if (stage_idx < 0)
+            snprintf(base_expr, sizeof(base_expr), "fc1");
+        else
+            snprintf(base_expr, sizeof(base_expr), "c1[%d]", stage_idx);
     } else {
         snprintf(base_expr, sizeof(base_expr), "%s", rn);
     }
@@ -713,6 +739,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         /* Update per-stage constants (only if this stage uses C0/C1) */
         EMIT("    r_c0 = c0[%d];\n", i);
         EMIT("    r_c1 = c1[%d];\n", i);
+        /* The RGB results, written to their registers only after the alpha
+         * portion has read its inputs: on the NV2A both portions read the
+         * stage's inputs before either writes. */
+        EMIT("    float3 o_ab%d = 0, o_cd%d = 0, o_sum%d = 0;\n", i, i, i);
 
         /*
          * RGB path: compute AB and CD products
@@ -764,19 +794,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         const char *omp = output_map_prefix(rgb_out->output_map);
         const char *oms = output_map_suffix(rgb_out->output_map);
 
-        /* Write to destination registers */
-        if (rgb_out->ab_dst != NV2A_REG_ZERO) {
-            EMIT("        %s.rgb = %sab_rgb%s;\n",
-                 reg_name(rgb_out->ab_dst), omp, oms);
-        }
-        if (rgb_out->cd_dst != NV2A_REG_ZERO) {
-            EMIT("        %s.rgb = %scd_rgb%s;\n",
-                 reg_name(rgb_out->cd_dst), omp, oms);
-        }
-        if (rgb_out->sum_dst != NV2A_REG_ZERO) {
-            EMIT("        %s.rgb = %ssum_rgb%s;\n",
-                 reg_name(rgb_out->sum_dst), omp, oms);
-        }
+        /* Kept for the destination registers, written after the alpha path */
+        EMIT("        o_ab%d = %sab_rgb%s;\n", i, omp, oms);
+        EMIT("        o_cd%d = %scd_rgb%s;\n", i, omp, oms);
+        EMIT("        o_sum%d = %ssum_rgb%s;\n", i, omp, oms);
 
         EMIT("    }\n");
 
@@ -825,7 +846,24 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                  reg_name(alpha_out->sum_dst), omp, oms);
         }
 
-        EMIT("    }\n\n");
+        EMIT("    }\n");
+
+        /* Now the RGB portion's writes. BLUE_TO_ALPHA also puts the blue of
+         * AB (or CD) into that register's alpha, over the alpha portion's
+         * write (xemu psh.c does the same). Future Perfect's uplink map uses
+         * it to turn a dot product into the hologram's circular mask while
+         * the hologram starts up; without it the map showed as a square. */
+        if (rgb_out->ab_dst != NV2A_REG_ZERO)
+            EMIT("    %s.rgb = o_ab%d;\n", reg_name(rgb_out->ab_dst), i);
+        if (rgb_out->cd_dst != NV2A_REG_ZERO)
+            EMIT("    %s.rgb = o_cd%d;\n", reg_name(rgb_out->cd_dst), i);
+        if (rgb_out->sum_dst != NV2A_REG_ZERO)
+            EMIT("    %s.rgb = o_sum%d;\n", reg_name(rgb_out->sum_dst), i);
+        if (rgb_out->ab_blue_to_alpha && rgb_out->ab_dst != NV2A_REG_ZERO)
+            EMIT("    %s.a = o_ab%d.b;\n", reg_name(rgb_out->ab_dst), i);
+        if (rgb_out->cd_blue_to_alpha && rgb_out->cd_dst != NV2A_REG_ZERO)
+            EMIT("    %s.a = o_cd%d.b;\n", reg_name(rgb_out->cd_dst), i);
+        EMIT("\n");
     }
 
     /* ---- Final combiner ----
@@ -848,14 +886,14 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     /* E * F product */
     EMIT("    {\n");
     EMIT("        float4 e_val = float4(");
-    emit_mapped_input(buf, bufsize, &off, &state->final_input[4], ".rgb", state->num_stages - 1);
+    emit_mapped_input(buf, bufsize, &off, &state->final_input[4], ".rgb", -1);
     EMIT(", ");
-    emit_mapped_input(buf, bufsize, &off, &state->final_input[4], ".a", state->num_stages - 1);
+    emit_mapped_input(buf, bufsize, &off, &state->final_input[4], ".a", -1);
     EMIT(");\n");
     EMIT("        float4 f_val = float4(");
-    emit_mapped_input(buf, bufsize, &off, &state->final_input[5], ".rgb", state->num_stages - 1);
+    emit_mapped_input(buf, bufsize, &off, &state->final_input[5], ".rgb", -1);
     EMIT(", ");
-    emit_mapped_input(buf, bufsize, &off, &state->final_input[5], ".a", state->num_stages - 1);
+    emit_mapped_input(buf, bufsize, &off, &state->final_input[5], ".a", -1);
     EMIT(");\n");
     EMIT("        r_ef = e_val * f_val;\n");
     EMIT("    }\n");
@@ -864,9 +902,9 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    r_v1r0sum = saturate(r_v1 + r_r0);\n\n");
 
     /* Final combiner: result.rgb = D + A*B + (1-A)*C */
-    /* Use last stage index for C0/C1 references in final combiner */
+    /* The final combiner's C0/C1 are its own constants (fc0/fc1) */
     {
-        int fc_stage = state->num_stages > 0 ? state->num_stages - 1 : 0;
+        int fc_stage = -1;
 
         EMIT("    float4 result;\n");
         EMIT("    {\n");

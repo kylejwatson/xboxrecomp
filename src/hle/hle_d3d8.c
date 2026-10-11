@@ -179,6 +179,11 @@ static uint32_t           g_shadow_last_color;
  * range, so the order of a title's frame can be read rather than inferred
  * from totals. Frame dumps say what a frame looked like; this says what the
  * title asked for to get there. Two or three frames is plenty. */
+/* F11 (overlay_frame) also traces the swaps it captures, up to this one, so
+ * a moment reached by playing comes with the same trace a scripted run gets
+ * from RECOMP_HLE_D3D8_TRACE_SWAPS. */
+static unsigned long g_trace_key_until;
+
 static int shadow_trace_on(void)
 {
     static long from = -1, to = -1;
@@ -192,6 +197,8 @@ static int shadow_trace_on(void)
             to = (*end == '-') ? strtol(end + 1, NULL, 10) : from;
         }
     }
+    if (g_shadow_swaps < g_trace_key_until)
+        return 1;
     return to > 0 && (long)g_shadow_swaps >= from && (long)g_shadow_swaps <= to;
 }
 
@@ -208,9 +215,13 @@ int hle_d3d8_trace_on(void)
  * title's swap callback when the title passes D3DSWAP_BYPASSCOPY (0x2).
  * TimeSplitters: Future Perfect is such a title: its callback draws the
  * back buffer through a colour-grading combiner into the front buffer,
- * inside Swap's own body, and follows with a Swap(D3DSWAP_FINISH) that
- * draws nothing. Every Swap still presents here; the second present of a
- * pair shows the same frame again, which is harmless. */
+ * after its Swap(D3DSWAP_BYPASSCOPY) and follows with a Swap(D3DSWAP_FINISH).
+ * The BYPASSCOPY swap is not shown on the console -- the picture reaches the
+ * screen through the callback's copy -- so it is not presented here either:
+ * presenting it put the ungraded world on screen for a moment every frame,
+ * which showed as a faint brightness flicker whenever the graded present that
+ * followed missed the same refresh (RECOMP_HLE_D3D8_PRESENT_BYPASS=1 restores
+ * it). */
 static uint32_t g_swap_effect;
 static DWORD              g_shadow_last_report;
 
@@ -435,6 +446,80 @@ int hle_d3d8_is_framebuffer(uint32_t phys)
             return 1;
     return 0;
 }
+
+/* The title's two frame buffers are one back buffer on the host. Usually
+ * harmless, but not when a title samples the frame buffer it is not drawing
+ * into. Future Perfect draws its world into one (physical 0x00204000), and
+ * its swap callback draws that through a colour-grading combiner into the
+ * other (0x00330000). On a frame where the game has no new world to draw it
+ * still swaps, and the callback grades the first buffer again: on the
+ * console that buffer still holds the ungraded world, so the picture comes
+ * out the same; here it held last frame's graded picture, which got graded a
+ * second time -- dark areas lifted, highlights dimmed, a blue cast -- and the
+ * screen flickered on every repeated frame.
+ *
+ * So the host remembers which frame buffer its back buffer holds, and when
+ * drawing moves to the other, keeps a copy of the picture it is about to
+ * lose. A frame buffer bound as a texture while the host holds the other one
+ * is filled from that copy (hle_d3d8_texture.c). Two full-screen copies a
+ * frame for a title that uses both buffers, none for one that does not. */
+#ifdef _WIN32
+static uint32_t g_target_fb;            /* frame buffer being drawn into, 0 offscreen */
+static uint32_t g_host_holds;           /* frame buffer the host back buffer holds */
+static struct { uint32_t phys; IDirect3DTexture8 *tex; int valid; } g_fb_kept[4];
+static unsigned long g_fb_gen;
+
+unsigned long hle_d3d8_fb_generation(void)
+{
+    return g_fb_gen;
+}
+
+void hle_d3d8_fb_before_write(void)
+{
+    uint32_t from = g_host_holds;
+    int i;
+
+    if (!g_shadow || !g_target_fb)
+        return;
+    g_fb_gen++;
+    if (from == g_target_fb || hle_d3d8_defer_on())
+        return;
+    g_host_holds = g_target_fb;
+    if (!from || !hle_d3d8_is_framebuffer(from))
+        return;
+    for (i = 0; i < 4 && g_fb_kept[i].tex && g_fb_kept[i].phys != from; i++)
+        ;
+    if (i == 4)
+        return;
+    if (!g_fb_kept[i].tex) {
+        if (FAILED(host_CreateTexture(g_shadow, g_shadow_width, g_shadow_height, 1,
+                                      D3DUSAGE_RENDERTARGET, D3DFMT_LIN_A8R8G8B8,
+                                      D3DPOOL_DEFAULT, &g_fb_kept[i].tex)) ||
+            !g_fb_kept[i].tex) {
+            g_fb_kept[i].tex = NULL;
+            return;
+        }
+        g_fb_kept[i].phys = from;
+        fprintf(stderr, "[HLE-D3D8] drawing moved from frame buffer 0x%08X to 0x%08X; "
+                "keeping the first one's picture for a title that samples it\n",
+                from, g_target_fb);
+        fflush(stderr);
+    }
+    g_fb_kept[i].valid = SUCCEEDED(xbox_D3D8CopyBackBufferToTexture(g_fb_kept[i].tex));
+}
+
+IDirect3DTexture8 *hle_d3d8_fb_kept(uint32_t phys)
+{
+    int i;
+
+    if (!g_host_holds || g_host_holds == phys)
+        return NULL;
+    for (i = 0; i < 4; i++)
+        if (g_fb_kept[i].tex && g_fb_kept[i].valid && g_fb_kept[i].phys == phys)
+            return g_fb_kept[i].tex;
+    return NULL;
+}
+#endif
 static IDirect3DSurface8 *g_device_depth;
 
 /* ------------------------------------------------------------- viewports */
@@ -1573,6 +1658,10 @@ HLE_EXPORT(D3DDevice_Clear)
 #ifdef _WIN32
     uint32_t flags = HLE_ARG(2), color = HLE_ARG(3);
     uint32_t z_bits = HLE_ARG(4), stencil = HLE_ARG(5);
+    /* Read before the XDK's body runs, like every argument here: it reuses
+     * its argument slots as locals, and read afterwards the count was 0 and
+     * a boxed clear became a full one (FP's uplink map, cleared around). */
+    uint32_t rect_count = HLE_ARG(0), rects_arg = HLE_ARG(1);
 #endif
 
     first_call(&seen, "D3DDevice_Clear", HLE_ARG(2));
@@ -1590,7 +1679,7 @@ HLE_EXPORT(D3DDevice_Clear)
         /* The title's rectangles, D3DRECT { x1, y1, x2, y2 } in guest
          * pixels: a boxed clear (FP's control hints) is not a full one. */
         {
-            uint32_t count = HLE_ARG(0), rects_va = HLE_ARG(1), i;
+            uint32_t count = rect_count, rects_va = rects_arg, i;
             D3DRECT rects[16];
 
             if (count > 16)
@@ -1609,8 +1698,8 @@ HLE_EXPORT(D3DDevice_Clear)
         g_shadow_clears++;
         g_shadow_last_color = color;
         if (shadow_trace_on())
-            fprintf(stderr, "[TRACE swap %lu] Clear flags 0x%X color 0x%08X\n",
-                    g_shadow_swaps, flags, color);
+            fprintf(stderr, "[TRACE swap %lu] Clear flags 0x%X color 0x%08X, %u rect(s)\n",
+                    g_shadow_swaps, flags, color, rects_arg ? rect_count : 0);
     }
 #endif
 }
@@ -1699,6 +1788,7 @@ static void overlay_frame(void)
          * no game running (src/replay). */
         hle_d3d8_capture_next_frame();
         shadow_dump_next_frame();
+        g_trace_key_until = g_shadow_swaps + 4;   /* this swap's pair and the next */
     }
     f11_was_down = f11;
     if (f9 && !f9_was_down)
@@ -1736,7 +1826,7 @@ static void overlay_frame(void)
  * the capture boundary, the frame dump, the overlay, the host present and
  * the five-second report. Shared because a title reaches this point
  * through either entry point -- see the Present replacement below. */
-static void frame_end_shadow(void)
+static void frame_end_shadow(uint32_t swap_flags)
 {
     if (g_shadow) {
         DWORD now = GetTickCount();
@@ -1807,9 +1897,14 @@ static void frame_end_shadow(void)
         g_frame_draws = 0;
         overlay_frame();                 /* after the dump: not in the captures */
         {
+            static int present_bypass = -1;
             LARGE_INTEGER a, b;
+
+            if (present_bypass < 0)
+                present_bypass = xbox_EnvSwitch("RECOMP_HLE_D3D8_PRESENT_BYPASS", 0);
             QueryPerformanceCounter(&a);
-            host_Swap(g_shadow, 0);
+            if (!(swap_flags & 0x2u) || present_bypass)    /* D3DSWAP_BYPASSCOPY */
+                host_Swap(g_shadow, 0);
             QueryPerformanceCounter(&b);
             g_swap_present_ticks += b.QuadPart - a.QuadPart;
             if (b.QuadPart - a.QuadPart > g_swap_present_max)
@@ -1856,6 +1951,7 @@ static void frame_end_shadow(void)
 HLE_EXPORT(D3DDevice_Swap)
 {
     static int seen;
+    uint32_t flags = HLE_ARG(0);         /* read before the title's body runs */
 
     /* Counted before anything else here runs, so RECOMP_FPS means the same
      * thing whatever is switched on below. */
@@ -1890,7 +1986,7 @@ HLE_EXPORT(D3DDevice_Swap)
         g_swap_timed++;
     }
 #ifdef _WIN32
-    frame_end_shadow();
+    frame_end_shadow(flags);
 #endif
 }
 
@@ -1941,7 +2037,7 @@ HLE_EXPORT(D3DDevice_Present)
         g_swap_timed++;
     }
 #ifdef _WIN32
-    frame_end_shadow();
+    frame_end_shadow(0);
 #endif
 }
 
@@ -3172,6 +3268,12 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     }
     g_target_width = w;
     g_target_height = h;
+    if (kind != 0)
+        g_target_fb = 0;
+    else if (rt)
+        g_target_fb = HLE_MEM32(rt + 4) & 0x0FFFFFFFu;
+    else
+        g_target_fb = g_backbuffer_va ? HLE_MEM32(g_backbuffer_va + 4) & 0x0FFFFFFFu : 0;
 
     /* The Xbox resets the viewport to the whole new target. */
     g_title_viewport.X = 0;
@@ -3377,7 +3479,10 @@ HLE_EXPORT(D3DDevice_CopyRects)
 {
     static int seen;
 #ifdef _WIN32
+    /* All read before the XDK's body runs: it reuses its argument slots, and
+     * read afterwards the rectangle count was always 0. */
     uint32_t src = HLE_ARG(0), dst = HLE_ARG(3);
+    uint32_t rects = HLE_ARG(1), count = HLE_ARG(2), points = HLE_ARG(4);
 #endif
 
     first_call(&seen, "D3DDevice_CopyRects", HLE_ARG(0));
@@ -3386,8 +3491,10 @@ HLE_EXPORT(D3DDevice_CopyRects)
     HLE_CALL_ORIGINAL(D3DDevice_CopyRects);
 #ifdef _WIN32
     if (g_shadow && src && dst && shadow_trace_on())
-        fprintf(stderr, "[TRACE swap %lu] CopyRects src 0x%08X data 0x%08X -> dst 0x%08X data 0x%08X\n",
-                g_shadow_swaps, src, HLE_MEM32(src + 4), dst, HLE_MEM32(dst + 4));
+        fprintf(stderr, "[TRACE swap %lu] CopyRects src 0x%08X data 0x%08X -> dst 0x%08X data 0x%08X"
+                " (%u rects at 0x%08X, points 0x%08X)\n",
+                g_shadow_swaps, src, HLE_MEM32(src + 4), dst, HLE_MEM32(dst + 4),
+                count, rects, points);
     if (g_shadow && src && dst) {
         static unsigned long from_screen, elsewhere;
         static int said_other;
@@ -3402,12 +3509,39 @@ HLE_EXPORT(D3DDevice_CopyRects)
          * returned, or -- before that is known -- any parentless surface of
          * the back buffer's size, the same test SetRenderTarget uses. */
         if (dst != g_backbuffer_va &&
-            (g_backbuffer_va ? src == g_backbuffer_va
+            (g_backbuffer_va ? (src == g_backbuffer_va || is_swap_data(HLE_MEM32(src + 4)))
                              : (!src_parent && sw == g_shadow_width && sh == g_shadow_height)) &&
             dst_parent && HLE_MEM32(dst_parent + 4) == HLE_MEM32(dst + 4)) {
             IDirect3DTexture8 *tex = hle_d3d8_render_texture(g_shadow, dst_parent);
 
-            if (tex && SUCCEEDED(xbox_D3D8CopyBackBufferToTexture(tex)))
+            /* With rectangles, only they move, each to its point (or to the
+             * same place). Future Perfect's uplink map is drawn into a corner
+             * of the back buffer and copied out of it by rectangle; copying
+             * the whole screen into the texture instead left the hologram
+             * showing a shrunken, nearly empty frame. */
+            if (tex && rects && count && count <= 64) {
+                uint32_t i;
+                int ok = 1;
+
+                for (i = 0; i < count; i++) {
+                    int32_t l = (int32_t)HLE_MEM32(rects + i * 16u);
+                    int32_t t = (int32_t)HLE_MEM32(rects + i * 16u + 4u);
+                    int32_t r = (int32_t)HLE_MEM32(rects + i * 16u + 8u);
+                    int32_t b = (int32_t)HLE_MEM32(rects + i * 16u + 12u);
+                    int32_t dx = points ? (int32_t)HLE_MEM32(points + i * 8u) : l;
+                    int32_t dy = points ? (int32_t)HLE_MEM32(points + i * 8u + 4u) : t;
+
+                    if (shadow_trace_on())
+                        fprintf(stderr, "[TRACE swap %lu] CopyRects rect %u: (%d,%d)-(%d,%d) "
+                                "-> (%d,%d) of %ux%u\n", g_shadow_swaps, i, l, t, r, b,
+                                dx, dy, dw, dh);
+                    if (FAILED(xbox_D3D8CopyBackBufferRectToTexture(tex, l, t, r - l, b - t,
+                                                                    dx, dy, dw, dh)))
+                        ok = 0;
+                }
+                if (ok)
+                    from_screen++;
+            } else if (tex && SUCCEEDED(xbox_D3D8CopyBackBufferToTexture(tex)))
                 from_screen++;
             if (from_screen == 1)
                 fprintf(stderr, "[HLE-D3D8] the title reads its own screen back: "

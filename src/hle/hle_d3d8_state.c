@@ -413,14 +413,14 @@ static DWORD ts_to_host(uint8_t kind, uint32_t v)
  * which is what Burnout 2's road does.
  *
  * The two numberings run in different orders, hence the groups. Xbox
- * PSCOMPAREMODE (42) and PSFINALCOMBINERCONSTANT0/1 (43, 44) have no host
- * state and are not forwarded. */
+ * PSCOMPAREMODE (42) has no host state and is not forwarded. */
 static const struct { uint8_t xbox; uint8_t host; uint8_t count; } g_ps_map[] = {
     {  0, 200, 8 },      /* PSALPHAINPUTS0-7                   */
     {  8, 208, 2 },      /* PSFINALCOMBINERINPUTSABCD, ...EFG  */
     { 10, 235, 8 },      /* PSCONSTANT0_0-7                    */
     { 18, 243, 8 },      /* PSCONSTANT1_0-7                    */
     { 26, 226, 8 },      /* PSALPHAOUTPUTS0-7                  */
+    { 43, 254, 2 },      /* PSFINALCOMBINERCONSTANT0-1         */
     { 34, 210, 8 },      /* PSRGBINPUTS0-7                     */
     { 45, 218, 8 },      /* PSRGBOUTPUTS0-7                    */
     { 53, 234, 1 },      /* PSCOMBINERCOUNT                    */
@@ -557,7 +557,7 @@ static uint32_t ps_state(uint32_t xbox)
 {
     uint32_t off;
 
-    if (!g_ps_def || (xbox >= 10 && xbox <= 25))
+    if (!g_ps_def || (xbox >= 10 && xbox <= 25) || xbox == 43 || xbox == 44)
         return guest_rs(xbox);
     if (xbox <= 7)        off = 0x00 + 4 * xbox;
     else if (xbox <= 9)   off = 0x20 + 4 * (xbox - 8);

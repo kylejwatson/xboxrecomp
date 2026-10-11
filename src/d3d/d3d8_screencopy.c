@@ -39,9 +39,10 @@ static struct {
     unsigned long             copies;
 } g;
 
-/* Source pixel = destination pixel * scale. One when the sizes agree, which
- * they do whenever a title reads back its own screen. */
-typedef struct { float scale_x, scale_y, pad0, pad1; } ScreenCopyConstants;
+/* Source pixel = destination pixel * scale + offset. Scale is one when the
+ * sizes agree, which they do whenever a title reads back its own screen; the
+ * offset is non-zero only for a CopyRects rectangle that moves. */
+typedef struct { float scale_x, scale_y, off_x, off_y; } ScreenCopyConstants;
 
 static const char kSource[] =
     "cbuffer ScreenCopy : register(b7) { float4 scale; };\n"
@@ -54,7 +55,7 @@ static const char kSource[] =
     "}\n"
     "Texture2D<float4> screen : register(t9);\n"
     "float4 ps_main(VSOut i) : SV_Target {\n"
-    "    int2 p = int2(i.pos.xy * scale.xy);\n"
+    "    int2 p = int2(i.pos.xy * scale.xy + scale.zw);\n"
     "    return screen.Load(int3(p, 0));\n"
     "}\n";
 
@@ -148,7 +149,11 @@ static int create(void)
     return 1;
 }
 
-HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
+/* rect: 0 = the whole texture from the whole screen; otherwise the title's
+ * pixels src_x,src_y,w,h go to dst_x,dst_y of a texture whose title size is
+ * dst_w x dst_h, and nothing else of it is written (a viewport, not a clear). */
+static HRESULT copy_region(IDirect3DTexture8 *dst, int rect, int src_x, int src_y,
+                           int w, int h, int dst_x, int dst_y, UINT dst_w, UINT dst_h)
 {
     ID3D11Device *dev = d3d8_GetD3D11Device();
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
@@ -247,7 +252,21 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
                                           D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         c.scale_x = tex->width ? (float)back_w / (float)tex->width : 1.0f;
         c.scale_y = tex->height ? (float)back_h / (float)tex->height : 1.0f;
-        c.pad0 = c.pad1 = 0.0f;
+        c.off_x = c.off_y = 0.0f;
+        if (rect) {
+            /* Scene pixels per title pixel, and texture pixels per title
+             * pixel: the two differ whenever the scene is scaled. */
+            UINT gw = d3d8_GetGuestWidth(), gh = d3d8_GetGuestHeight();
+            float sx = gw ? (float)back_w / (float)gw : 1.0f;
+            float sy = gh ? (float)back_h / (float)gh : 1.0f;
+            float tx = dst_w ? (float)tex->width / (float)dst_w : 1.0f;
+            float ty = dst_h ? (float)tex->height / (float)dst_h : 1.0f;
+
+            c.scale_x = sx / tx;
+            c.scale_y = sy / ty;
+            c.off_x = (float)(src_x - dst_x) * sx;
+            c.off_y = (float)(src_y - dst_y) * sy;
+        }
         memcpy(mapped.pData, &c, sizeof c);
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g.cb, 0);
     }
@@ -255,6 +274,15 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
     vp.TopLeftX = vp.TopLeftY = 0.0f;
     vp.Width = (float)tex->width;
     vp.Height = (float)tex->height;
+    if (rect) {
+        float tx = dst_w ? (float)tex->width / (float)dst_w : 1.0f;
+        float ty = dst_h ? (float)tex->height / (float)dst_h : 1.0f;
+
+        vp.TopLeftX = (float)dst_x * tx;
+        vp.TopLeftY = (float)dst_y * ty;
+        vp.Width = (float)w * tx;
+        vp.Height = (float)h * ty;
+    }
     vp.MinDepth = 0.0f;
     vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
@@ -283,6 +311,34 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
     if (saved_dsv) ID3D11DepthStencilView_Release(saved_dsv);
     ID3D11RenderTargetView_Release(rtv);
     g.copies++;
+    return S_OK;
+}
+
+HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
+{
+    return copy_region(dst, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+HRESULT xbox_D3D8CopyBackBufferRectToTexture(IDirect3DTexture8 *dst,
+                                             int src_x, int src_y, int w, int h,
+                                             int dst_x, int dst_y,
+                                             UINT dst_w, UINT dst_h)
+{
+    if (w <= 0 || h <= 0)
+        return S_OK;
+    return copy_region(dst, 1, src_x, src_y, w, h, dst_x, dst_y, dst_w, dst_h);
+}
+
+HRESULT xbox_D3D8CopyTexture(IDirect3DTexture8 *dst, IDirect3DTexture8 *src)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    D3D8Texture *d = (D3D8Texture *)dst, *s = (D3D8Texture *)src;
+
+    if (!ctx || !d || !s || !d->d3d11_texture || !s->d3d11_texture ||
+        d->width != s->width || d->height != s->height || d->dxgi_format != s->dxgi_format)
+        return E_INVALIDARG;
+    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)d->d3d11_texture,
+                                     (ID3D11Resource *)s->d3d11_texture);
     return S_OK;
 }
 

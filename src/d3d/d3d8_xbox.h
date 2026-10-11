@@ -400,6 +400,9 @@ typedef enum D3DRENDERSTATETYPE {
     D3DRS_PSTEXTUREMODES           = 251,
     D3DRS_PSDOTMAPPING             = 252,
     D3DRS_PSINPUTTEXTURE           = 253,
+    /* The final combiner's own C0/C1 (Xbox PSFINALCOMBINERCONSTANT0/1). */
+    D3DRS_PSFINALCOMBINERCONSTANT0 = 254,
+    D3DRS_PSFINALCOMBINERCONSTANT1 = 255,
 } D3DRENDERSTATETYPE;
 
 typedef enum D3DTEXTURESTAGESTATETYPE {
@@ -1192,6 +1195,17 @@ float xbox_D3D8ClaimHorPlus(void);
    nothing renders on that side. Scales if the texture is not screen-sized.
    The destination must be a render-target texture. */
 HRESULT       xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst);
+/* The same with CopyRects' rectangle: the title's pixels (src_x, src_y,
+   w x h) of its back buffer go to (dst_x, dst_y) of a texture whose title
+   size is dst_w x dst_h; the rest of the texture is left alone. */
+HRESULT       xbox_D3D8CopyBackBufferRectToTexture(IDirect3DTexture8 *dst,
+                                                   int src_x, int src_y, int w, int h,
+                                                   int dst_x, int dst_y,
+                                                   UINT dst_w, UINT dst_h);
+/* One texture's contents into another of the same size (both render-target
+   textures); used to keep a frame buffer's picture after the host's single
+   back buffer has moved on to another. */
+HRESULT       xbox_D3D8CopyTexture(IDirect3DTexture8 *dst, IDirect3DTexture8 *src);
 unsigned long xbox_D3D8ScreenCopyCount(void);
 void          xbox_D3D8ScreenCopyShutdown(void);
 

@@ -834,6 +834,7 @@ HRESULT host_Clear(IDirect3DDevice8 *dev, DWORD count, const D3DRECT *rects,
         c.stencil    = stencil;
         chunk(D3D8CAP_CLEAR, &c, sizeof c, r, (size_t)n * sizeof r[0], NULL, 0);
     }
+    hle_d3d8_fb_before_write();
     return dev->lpVtbl->Clear(dev, count, rects, flags, color, z, stencil);
 }
 
@@ -1102,6 +1103,7 @@ HRESULT host_DrawPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type,
             g_draws++;
         }
     }
+    hle_d3d8_fb_before_write();
     return dev->lpVtbl->DrawPrimitiveUP(dev, type, prims, vertices, stride);
 }
 
@@ -1149,6 +1151,7 @@ HRESULT host_DrawIndexedPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type
             g_draws++;
         }
     }
+    hle_d3d8_fb_before_write();
     return dev->lpVtbl->DrawIndexedPrimitiveUP(dev, type, min_index, num_vertices,
                                                prims, indices, index_format,
                                                vertices, stride);

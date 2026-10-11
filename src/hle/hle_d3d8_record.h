@@ -85,6 +85,18 @@ void hle_d3d8_defer_op(void (*fn)(const void *arg), const void *arg, size_t size
 /* Run everything queued, in order. Safe to call when nothing is. */
 void hle_d3d8_defer_flush(void);
 
+/* Before every draw or clear the host carries out (hle_d3d8.c): the host has
+ * one back buffer for the title's two frame buffers, so when drawing moves
+ * from one to the other, the picture the first held is kept in a texture for
+ * a title that samples that frame buffer later. */
+void hle_d3d8_fb_before_write(void);
+/* That kept picture, for a frame buffer (physical address) the host back
+ * buffer no longer holds; NULL when it does hold it, or nothing was kept. */
+IDirect3DTexture8 *hle_d3d8_fb_kept(uint32_t phys);
+/* Counts draws and clears into a frame buffer; a copy of it taken at an
+ * older count is out of date. */
+unsigned long hle_d3d8_fb_generation(void);
+
 /* ----------------------------------------------------------- device calls */
 
 HRESULT host_Clear(IDirect3DDevice8 *dev, DWORD count, const D3DRECT *rects,

@@ -195,6 +195,8 @@ typedef struct NV2ACombinerOutput {
     int                  cd_dot;     /* 1 = dot product for CD */
     int                  mux_sum;    /* 1 = mux(R0.a, AB, CD) instead of AB+CD */
     NV2AOutputMapping    output_map; /* Scale/bias applied to results */
+    int                  ab_blue_to_alpha; /* RGB portion: AB's blue also to its register's alpha */
+    int                  cd_blue_to_alpha; /* RGB portion: CD's blue also to its register's alpha */
 } NV2ACombinerOutput;
 
 /* ================================================================
