@@ -666,7 +666,25 @@ void xbox_NameCurrentThread(const wchar_t *name)
 
 #else  /* !_WIN32 */
 
+#include <pthread.h>
+#include <wchar.h>
+
+/* RECOMP_SAMPLE is a Windows tool (it suspends threads and reads their
+ * context through dbghelp); on Linux use perf, which needs nothing here. */
 void xbox_SamplerStart(void) {}
-void xbox_NameCurrentThread(const wchar_t *name) { (void)name; }
+
+/* The name shows in gdb, perf and top -H. Linux keeps 15 characters. */
+void xbox_NameCurrentThread(const wchar_t *name)
+{
+    char narrow[16];
+    size_t i;
+
+    if (!name)
+        return;
+    for (i = 0; i < sizeof narrow - 1 && name[i]; i++)
+        narrow[i] = (name[i] > 0 && name[i] < 0x80) ? (char)name[i] : '?';
+    narrow[i] = '\0';
+    pthread_setname_np(pthread_self(), narrow);
+}
 
 #endif

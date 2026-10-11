@@ -11,7 +11,9 @@
 #if !defined(_WIN32)
 
 /* Enable memfd_create, MAP_FIXED_NOREPLACE, timegm. Must precede all #includes. */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include "win32_compat.h"
 
@@ -1280,7 +1282,8 @@ BOOL FlushFileBuffers(HANDLE h)
 /* via SDL_GetKeyboardState when main.c gets its SDL2 port.              */
 /* ===================================================================== */
 
-SHORT GetAsyncKeyState(int vKey)          { (void)vKey; return 0; }
+/* GetAsyncKeyState, GetForegroundWindow, GetWindowThreadProcessId and
+ * XInputGetState are answered by the window's event loop (host_sdl.c). */
 HWND  FindWindowA(LPCSTR c, LPCSTR w)     { (void)c; (void)w; return NULL; }
 HWND  GetActiveWindow(void)               { return NULL; }
 BOOL  SetWindowTextA(HWND h, LPCSTR t)    { (void)h; (void)t; return TRUE; }
@@ -1302,9 +1305,6 @@ BOOL    PeekMessageA(LPMSG m, HWND w, UINT a, UINT b, UINT f)
 BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
 LRESULT DispatchMessageA(const MSG *m) { (void)m; return 0; }
 
-/* XInput stub: real gamepad is wired through input_compat (SDL2). */
-DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
-{ (void)idx; if (state) memset(state, 0, sizeof(*state)); return ERROR_DEVICE_NOT_CONNECTED; }
 
 BOOL TerminateProcess(HANDLE process, UINT exitCode)
 {
@@ -1672,8 +1672,299 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
 }
 
+/* ===================================================================== */
+/* WaitOnAddress                                                         */
+/* ===================================================================== */
+
+#if defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+
+BOOL WaitOnAddress(volatile VOID *address, PVOID compare, SIZE_T size, DWORD ms)
+{
+    struct timespec ts, *tp = NULL;
+    long r;
+
+    if (size != 4) {                    /* only what the runtime uses */
+        if (memcmp((const void *)address, compare, size) == 0)
+            Sleep(ms == INFINITE ? 1 : (ms ? 1 : 0));
+        return TRUE;
+    }
+    if (ms != INFINITE) {
+        ts.tv_sec = ms / 1000;
+        ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+        tp = &ts;
+    }
+    r = syscall(SYS_futex, (int *)address, FUTEX_WAIT_PRIVATE,
+                *(const int *)compare, tp, NULL, 0);
+    if (r != 0 && errno == ETIMEDOUT) {
+        SetLastError(ERROR_TIMEOUT);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+VOID WakeByAddressSingle(PVOID address)
+{
+    syscall(SYS_futex, (int *)address, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+}
+
+VOID WakeByAddressAll(PVOID address)
+{
+    syscall(SYS_futex, (int *)address, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, NULL, NULL, 0);
+}
+#else
+BOOL WaitOnAddress(volatile VOID *address, PVOID compare, SIZE_T size, DWORD ms)
+{
+    if (memcmp((const void *)address, compare, size) == 0)
+        Sleep(ms == INFINITE ? 1 : (ms ? 1 : 0));
+    return TRUE;
+}
+VOID WakeByAddressSingle(PVOID address) { (void)address; }
+VOID WakeByAddressAll(PVOID address) { (void)address; }
+#endif
+
+/* ===================================================================== */
+/* dbghelp subset and the module path                                    */
+/* ===================================================================== */
+
+#include <dlfcn.h>
+
+DWORD SymSetOptions(DWORD options) { return options; }
+BOOL  SymInitialize(HANDLE process, PCSTR search_path, BOOL invade)
+{ (void)process; (void)search_path; (void)invade; return TRUE; }
+
+BOOL SymFromAddr(HANDLE process, DWORD64 address, PDWORD64 displacement,
+                 PSYMBOL_INFO symbol)
+{
+    Dl_info info;
+    size_t n;
+
+    (void)process;
+    if (!symbol || !dladdr((void *)(uintptr_t)address, &info) || !info.dli_sname)
+        return FALSE;
+    n = strlen(info.dli_sname);
+    if (symbol->MaxNameLen && n >= symbol->MaxNameLen)
+        n = symbol->MaxNameLen - 1;
+    memcpy(symbol->Name, info.dli_sname, n);
+    symbol->Name[n] = '\0';
+    symbol->NameLen = (ULONG)n;
+    symbol->Address = (ULONG64)(uintptr_t)info.dli_saddr;
+    symbol->ModBase = (ULONG64)(uintptr_t)info.dli_fbase;
+    if (displacement)
+        *displacement = address - (DWORD64)(uintptr_t)info.dli_saddr;
+    return TRUE;
+}
+
+DWORD GetModuleFileNameA(HMODULE module, LPSTR name, DWORD size)
+{
+    ssize_t n;
+
+    if (module || !name || !size)
+        return 0;
+    n = readlink("/proc/self/exe", name, size - 1);
+    if (n <= 0)
+        return 0;
+    name[n] = '\0';
+    return (DWORD)n;
+}
+
+/* ===================================================================== */
+/* Vectored exception handlers, on POSIX signals                         */
+/* ===================================================================== */
+
+/* The runtime traps device registers (NV2A, APU, AC97) and watched guest
+ * pages by protecting them and servicing the fault: a handler decodes the
+ * faulting instruction from the CONTEXT, performs the access and moves Rip
+ * past it. On Windows that is a vectored exception handler; here it is a
+ * SA_SIGINFO handler that builds the same EXCEPTION_POINTERS from the
+ * ucontext_t, runs the registered handlers in order, and copies the CONTEXT
+ * back when one resumes. Nothing a handler sees differs from Windows. */
+
+#if defined(__linux__) && defined(__x86_64__)
+#include <signal.h>
+#include <ucontext.h>
+
+#define W32_MAX_VEH 16
+static PVECTORED_EXCEPTION_HANDLER s_veh[W32_MAX_VEH];
+static volatile int s_veh_count;
+static pthread_mutex_t s_veh_lock = PTHREAD_MUTEX_INITIALIZER;
+static int s_veh_installed;
+static const int s_veh_signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP };
+
+#define W32_TRAP_FLAG 0x100u
+
+static void ctx_from_uc(PCONTEXT c, const ucontext_t *uc)
+{
+    const greg_t *g = uc->uc_mcontext.gregs;
+    memset(c, 0, sizeof *c);
+    c->Rax = (uint64_t)g[REG_RAX]; c->Rcx = (uint64_t)g[REG_RCX];
+    c->Rdx = (uint64_t)g[REG_RDX]; c->Rbx = (uint64_t)g[REG_RBX];
+    c->Rsp = (uint64_t)g[REG_RSP]; c->Rbp = (uint64_t)g[REG_RBP];
+    c->Rsi = (uint64_t)g[REG_RSI]; c->Rdi = (uint64_t)g[REG_RDI];
+    c->R8  = (uint64_t)g[REG_R8];  c->R9  = (uint64_t)g[REG_R9];
+    c->R10 = (uint64_t)g[REG_R10]; c->R11 = (uint64_t)g[REG_R11];
+    c->R12 = (uint64_t)g[REG_R12]; c->R13 = (uint64_t)g[REG_R13];
+    c->R14 = (uint64_t)g[REG_R14]; c->R15 = (uint64_t)g[REG_R15];
+    c->Rip = (uint64_t)g[REG_RIP];
+    c->EFlags = (uint32_t)g[REG_EFL];
+    if (uc->uc_mcontext.fpregs)
+        c->MxCsr = uc->uc_mcontext.fpregs->mxcsr;
+}
+
+static void ctx_to_uc(const CONTEXT *c, ucontext_t *uc)
+{
+    greg_t *g = uc->uc_mcontext.gregs;
+    g[REG_RAX] = (greg_t)c->Rax; g[REG_RCX] = (greg_t)c->Rcx;
+    g[REG_RDX] = (greg_t)c->Rdx; g[REG_RBX] = (greg_t)c->Rbx;
+    g[REG_RSP] = (greg_t)c->Rsp; g[REG_RBP] = (greg_t)c->Rbp;
+    g[REG_RSI] = (greg_t)c->Rsi; g[REG_RDI] = (greg_t)c->Rdi;
+    g[REG_R8]  = (greg_t)c->R8;  g[REG_R9]  = (greg_t)c->R9;
+    g[REG_R10] = (greg_t)c->R10; g[REG_R11] = (greg_t)c->R11;
+    g[REG_R12] = (greg_t)c->R12; g[REG_R13] = (greg_t)c->R13;
+    g[REG_R14] = (greg_t)c->R14; g[REG_R15] = (greg_t)c->R15;
+    g[REG_RIP] = (greg_t)c->Rip;
+    g[REG_EFL] = (greg_t)c->EFlags;
+    if (uc->uc_mcontext.fpregs)
+        uc->uc_mcontext.fpregs->mxcsr = c->MxCsr;
+}
+
+static void veh_signal(int sig, siginfo_t *si, void *ucv)
+{
+    ucontext_t *uc = (ucontext_t *)ucv;
+    EXCEPTION_RECORD rec;
+    CONTEXT ctx;
+    EXCEPTION_POINTERS ep;
+    int saved_errno = errno, i, n;
+
+    memset(&rec, 0, sizeof rec);
+    ctx_from_uc(&ctx, uc);
+    rec.ExceptionAddress = (PVOID)(uintptr_t)ctx.Rip;
+
+    switch (sig) {
+    case SIGSEGV:
+    case SIGBUS:
+        rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        rec.NumberParameters = 2;
+        /* Page-fault error code bit 1: the access was a write. */
+        rec.ExceptionInformation[0] =
+            (uc->uc_mcontext.gregs[REG_ERR] & 2) ? 1 : 0;
+        rec.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
+        break;
+    case SIGTRAP:
+        if (si->si_code == TRAP_TRACE || (ctx.EFlags & W32_TRAP_FLAG)) {
+            /* Windows clears TF before the handler runs; a handler that
+             * wants another step sets it again. */
+            rec.ExceptionCode = EXCEPTION_SINGLE_STEP;
+            ctx.EFlags &= ~W32_TRAP_FLAG;
+        } else {
+            rec.ExceptionCode = EXCEPTION_BREAKPOINT;
+            /* Windows reports int3 at the instruction itself. */
+            ctx.Rip -= 1;
+            rec.ExceptionAddress = (PVOID)(uintptr_t)ctx.Rip;
+        }
+        break;
+    case SIGILL:
+        rec.ExceptionCode = (si->si_code == ILL_PRVOPC)
+                          ? EXCEPTION_PRIV_INSTRUCTION
+                          : EXCEPTION_ILLEGAL_INSTRUCTION;
+        break;
+    case SIGFPE:
+        switch (si->si_code) {
+        case FPE_INTDIV: rec.ExceptionCode = EXCEPTION_INT_DIVIDE_BY_ZERO; break;
+        case FPE_INTOVF: rec.ExceptionCode = EXCEPTION_INT_OVERFLOW; break;
+        case FPE_FLTDIV: rec.ExceptionCode = EXCEPTION_FLT_DIVIDE_BY_ZERO; break;
+        case FPE_FLTOVF: rec.ExceptionCode = EXCEPTION_FLT_OVERFLOW; break;
+        case FPE_FLTUND: rec.ExceptionCode = EXCEPTION_FLT_UNDERFLOW; break;
+        case FPE_FLTRES: rec.ExceptionCode = EXCEPTION_FLT_INEXACT_RESULT; break;
+        default:         rec.ExceptionCode = EXCEPTION_FLT_INVALID_OPERATION; break;
+        }
+        break;
+    default:
+        rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        break;
+    }
+
+    ep.ExceptionRecord = &rec;
+    ep.ContextRecord = &ctx;
+    n = s_veh_count;
+    for (i = 0; i < n; i++) {
+        PVECTORED_EXCEPTION_HANDLER h = s_veh[i];
+        if (h && h(&ep) == EXCEPTION_CONTINUE_EXECUTION) {
+            ctx_to_uc(&ctx, uc);
+            errno = saved_errno;
+            return;
+        }
+    }
+
+    /* Nobody wanted it: let the default action happen, as an unhandled
+     * exception would on Windows. Returning re-executes the instruction,
+     * which faults again under SIG_DFL; a trap is raised again instead,
+     * since int3 and a step do not repeat by themselves. */
+    signal(sig, SIG_DFL);
+    if (sig == SIGTRAP || sig == SIGFPE)
+        raise(sig);
+}
+
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
-{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
+{
+    PVOID handle = NULL;
+
+    if (!Handler)
+        return NULL;
+    pthread_mutex_lock(&s_veh_lock);
+    if (s_veh_count < W32_MAX_VEH) {
+        if (First) {
+            memmove(&s_veh[1], &s_veh[0], sizeof s_veh[0] * (size_t)s_veh_count);
+            s_veh[0] = Handler;
+        } else {
+            s_veh[s_veh_count] = Handler;
+        }
+        __atomic_store_n(&s_veh_count, s_veh_count + 1, __ATOMIC_SEQ_CST);
+        handle = (PVOID)Handler;
+    }
+    if (handle && !s_veh_installed) {
+        struct sigaction sa;
+        size_t k;
+
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = veh_signal;
+        /* SA_NODEFER: a handler that faults (a decoder bug reading a bad
+         * pointer) reaches the default action instead of blocking forever. */
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        for (k = 0; k < sizeof s_veh_signals / sizeof s_veh_signals[0]; k++)
+            sigaction(s_veh_signals[k], &sa, NULL);
+        s_veh_installed = 1;
+    }
+    pthread_mutex_unlock(&s_veh_lock);
+    return handle;
+}
+
+ULONG RemoveVectoredExceptionHandler(PVOID h)
+{
+    int i, found = 0;
+
+    pthread_mutex_lock(&s_veh_lock);
+    for (i = 0; i < s_veh_count; i++) {
+        if ((PVOID)s_veh[i] == h) {
+            memmove(&s_veh[i], &s_veh[i + 1],
+                    sizeof s_veh[0] * (size_t)(s_veh_count - i - 1));
+            s_veh_count--;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_veh_lock);
+    return (ULONG)found;
+}
+
+#else  /* not Linux x86-64: no ucontext register map here yet */
+
+PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+{ (void)First; (void)Handler; return NULL; }
 ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
+
+#endif
 
 #endif /* !_WIN32 */

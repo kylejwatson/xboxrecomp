@@ -9,14 +9,22 @@
  * The text is drawn by GDI into a 32-bit DIB and uploaded to a texture when
  * it changes, which is roughly twice a second for a frame-rate counter. A
  * real font at a real size costs less code than an embedded glyph table and
- * reads better at any window size.
+ * reads better at any window size. Off Windows the same buffer is filled by
+ * FreeType, from the monospace font fontconfig names.
  */
 #include "d3d8_internal.h"
 #include "d3d8_overlay.h"
 
 #include <d3dcompiler.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#if !defined(_WIN32)
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <fontconfig/fontconfig.h>
+#endif
 
 #define OVERLAY_W    512
 #define OVERLAY_H     28
@@ -33,9 +41,14 @@ static struct {
     ID3D11BlendState         *blend;
     ID3D11DepthStencilState  *depth;
     ID3D11RasterizerState    *raster;
+#if defined(_WIN32)
     HDC                       dc;
     HBITMAP                   bitmap;
     HFONT                     font;
+#else
+    FT_Library                ft;
+    FT_Face                   face;
+#endif
     void                     *bits;      /* the DIB's pixels, BGRA top-down */
     int                       text_w;    /* what the last render measured */
     char                      text[128];
@@ -88,7 +101,9 @@ static int overlay_create(void)
     D3D11_BLEND_DESC bl;
     D3D11_DEPTH_STENCIL_DESC ds;
     D3D11_RASTERIZER_DESC rd;
+#if defined(_WIN32)
     BITMAPINFO bi;
+#endif
     ID3DBlob *code = NULL, *err = NULL;
     HRESULT hr;
 
@@ -173,6 +188,7 @@ static int overlay_create(void)
     hr = ID3D11Device_CreateRasterizerState(dev, &rd, &g.raster);
     if (FAILED(hr)) { overlay_fail("CreateRasterizerState", hr); return 0; }
 
+#if defined(_WIN32)
     /* GDI side: a top-down 32-bit DIB the text is drawn into. */
     g.dc = CreateCompatibleDC(NULL);
     if (!g.dc) { overlay_fail("CreateCompatibleDC", 0); return 0; }
@@ -193,6 +209,33 @@ static int overlay_create(void)
     SetBkMode(g.dc, OPAQUE);
     SetBkColor(g.dc, RGB(0, 0, 0));
     SetTextColor(g.dc, RGB(255, 255, 255));
+#else
+    /* FreeType side: the same top-down BGRA buffer, and a monospace font. */
+    g.bits = calloc((size_t)OVERLAY_W * OVERLAY_H, 4);
+    if (!g.bits) { overlay_fail("calloc", 0); return 0; }
+    if (FT_Init_FreeType(&g.ft) != 0) { overlay_fail("FT_Init_FreeType", 0); return 0; }
+    {
+        char path[512] = "";
+        FcPattern *pat, *match;
+        FcResult res;
+        FcChar8 *file = NULL;
+
+        if (FcInit() && (pat = FcNameParse((const FcChar8 *)"monospace:weight=semibold")) != NULL) {
+            FcConfigSubstitute(NULL, pat, FcMatchPattern);
+            FcDefaultSubstitute(pat);
+            match = FcFontMatch(NULL, pat, &res);
+            if (match && FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch)
+                snprintf(path, sizeof path, "%s", (const char *)file);
+            if (match) FcPatternDestroy(match);
+            FcPatternDestroy(pat);
+        }
+        if (!path[0] || FT_New_Face(g.ft, path, 0, &g.face) != 0) {
+            overlay_fail("finding a monospace font", 0);
+            return 0;
+        }
+        FT_Set_Pixel_Sizes(g.face, 0, 18);
+    }
+#endif
     return 1;
 }
 
@@ -201,9 +244,11 @@ static int overlay_set_text(const char *text)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     D3D11_MAPPED_SUBRESOURCE mapped;
+#if defined(_WIN32)
     wchar_t wide[128];
     RECT rect;
     SIZE extent;
+#endif
     int len, i;
 
     if (strcmp(text, g.text) == 0)
@@ -213,6 +258,7 @@ static int overlay_set_text(const char *text)
     if (len > (int)(sizeof g.text - 1)) len = (int)(sizeof g.text - 1);
     memcpy(g.text, text, (size_t)len);
     g.text[len] = '\0';
+#if defined(_WIN32)
     for (i = 0; i < len; i++)
         wide[i] = (wchar_t)(unsigned char)g.text[i];
 
@@ -225,6 +271,37 @@ static int overlay_set_text(const char *text)
     g.text_w = extent.cx + 12 > OVERLAY_W ? OVERLAY_W : (int)extent.cx + 12;
     ExtTextOutW(g.dc, 6, 4, ETO_OPAQUE, &rect, wide, (UINT)len, NULL);
     GdiFlush();
+#else
+    memset(g.bits, 0, (size_t)OVERLAY_W * OVERLAY_H * 4);
+    {
+        /* White on black, coverage in every colour channel, as GDI's. */
+        int pen = 6, baseline = 4 + (int)(g.face->size->metrics.ascender >> 6);
+        for (i = 0; i < len; i++) {
+            FT_GlyphSlot gl;
+            int x, y;
+            if (FT_Load_Char(g.face, (unsigned char)g.text[i], FT_LOAD_RENDER) != 0)
+                continue;
+            gl = g.face->glyph;
+            for (y = 0; y < (int)gl->bitmap.rows; y++) {
+                int py = baseline - gl->bitmap_top + y;
+                if (py < 0 || py >= OVERLAY_H)
+                    continue;
+                for (x = 0; x < (int)gl->bitmap.width; x++) {
+                    int px = pen + gl->bitmap_left + x;
+                    unsigned char v = gl->bitmap.buffer[y * gl->bitmap.pitch + x];
+                    unsigned char *d;
+                    if (px < 0 || px >= OVERLAY_W || !v)
+                        continue;
+                    d = (unsigned char *)g.bits + ((size_t)py * OVERLAY_W + (size_t)px) * 4;
+                    d[0] = d[1] = d[2] = v;
+                    d[3] = 255;
+                }
+            }
+            pen += (int)(gl->advance.x >> 6);
+        }
+        g.text_w = pen + 6 > OVERLAY_W ? OVERLAY_W : pen + 6;
+    }
+#endif
 
     if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g.texture, 0,
                                        D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -309,9 +386,15 @@ void d3d8_overlay_shutdown(void)
     if (g.blend)   { ID3D11BlendState_Release(g.blend);          g.blend = NULL; }
     if (g.depth)   { ID3D11DepthStencilState_Release(g.depth);   g.depth = NULL; }
     if (g.raster)  { ID3D11RasterizerState_Release(g.raster);    g.raster = NULL; }
+#if defined(_WIN32)
     if (g.bitmap)  { DeleteObject(g.bitmap);                     g.bitmap = NULL; }
     if (g.font)    { DeleteObject(g.font);                       g.font = NULL; }
     if (g.dc)      { DeleteDC(g.dc);                             g.dc = NULL; }
+#else
+    if (g.face)    { FT_Done_Face(g.face);                       g.face = NULL; }
+    if (g.ft)      { FT_Done_FreeType(g.ft);                     g.ft = NULL; }
+    free(g.bits);
+#endif
     g.bits = NULL;
     g.text[0] = '\0';
     g.text_w = 0;

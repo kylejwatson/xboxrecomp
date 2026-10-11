@@ -115,6 +115,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 
 /* ======================================================================== */
 #else /* !_WIN32 */
+#include "platform/host_sdl.h"
 /* ====================  SDL2 GameController backend  ===================== */
 /* ======================================================================== */
 
@@ -142,6 +143,7 @@ static void open_controllers(void)
 void xbox_InputInit(void)
 {
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
+        host_sdl_hints();
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     open_controllers();
 }

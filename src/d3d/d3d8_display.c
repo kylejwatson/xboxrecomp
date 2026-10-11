@@ -13,7 +13,6 @@
 #include "d3d8_display.h"
 #include "recomp_config.h"
 
-#if defined(_WIN32)
 
 #include <d3dcompiler.h>
 #include <stdint.h>
@@ -404,4 +403,3 @@ void d3d8_display_shutdown(void)
     g.failed = 0;
 }
 
-#endif /* _WIN32 */

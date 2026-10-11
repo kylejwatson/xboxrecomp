@@ -31,14 +31,17 @@ add_library(xbox_hle STATIC
     input_model.c
 )
 
-# Host backends. XAudio2 and XInput exist only on Windows. A POSIX host needs
-# its own recomp_audio_output_* (audio_output.h) and recomp_input_host_sample
-# (input_host.h) -- SDL2 is the obvious candidate, since xbox_apu and
-# xbox_input already use it. Until those exist the library compiles on POSIX,
-# but a title that links it there will be missing those symbols.
+# Host backends: XAudio2 on Windows, SDL2 elsewhere (audio_output.h). The
+# input host is shared: it reads the bindings (src/input), which read XInput
+# on Windows and the SDL host (src/platform/host_sdl.c) elsewhere.
 if(WIN32)
     target_sources(xbox_hle PRIVATE
         audio_output_xaudio2.cpp
+        input_host.c
+    )
+else()
+    target_sources(xbox_hle PRIVATE
+        audio_output_sdl.c
         input_host.c
     )
 endif()
@@ -48,9 +51,12 @@ target_link_libraries(xbox_hle PUBLIC xbox_kernel)
 # Host device choice and per-control bindings (src/input/input_bindings.c),
 # shared with the USB gamepad so one config file covers both input paths.
 target_link_libraries(xbox_hle PUBLIC xbox_input)
+# The D3D8 replacements drive the host renderer in src/d3d, and open a
+# window of their own for it.
+target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video)
 if(WIN32)
-    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0)
-    # The D3D8 replacements drive the host renderer in src/d3d, and open a
-    # window of their own for it.
-    target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video user32)
+    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0 user32)
+else()
+    find_package(SDL2 REQUIRED)
+    target_link_libraries(xbox_hle PRIVATE SDL2::SDL2 m)
 endif()

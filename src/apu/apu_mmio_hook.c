@@ -15,11 +15,11 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
-/* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
- * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
- * now the whole body is Windows-only so apu_emu links on Debian. */
-#if defined(_WIN32)
-#include <windows.h>
+/* The MMIO hook is an x86-64 instruction decoder run from a vectored
+ * exception handler: Win32 VEH on Windows, the sigaction-backed emulation in
+ * src/platform/win32_compat.c elsewhere. Both hand it the same CONTEXT. */
+#include "platform/xbox_winnt.h"
+#include "platform/mmio_decode.h"
 /* getenv: without <stdlib.h> its pointer is truncated to int. */
 #include <stdlib.h>
 
@@ -35,228 +35,33 @@ static int g_apu_mmio_write_count = 0;
 static int g_apu_mmio_decode_fail = 0;
 
 /* ============================================================
- * x86-64 register access helpers (same as NV2A hook)
- * ============================================================ */
-
-static uint64_t *ctx_reg64(PCONTEXT ctx, int reg)
-{
-    switch (reg & 0xF) {
-    case 0:  return (uint64_t*)&ctx->Rax;
-    case 1:  return (uint64_t*)&ctx->Rcx;
-    case 2:  return (uint64_t*)&ctx->Rdx;
-    case 3:  return (uint64_t*)&ctx->Rbx;
-    case 4:  return (uint64_t*)&ctx->Rsp;
-    case 5:  return (uint64_t*)&ctx->Rbp;
-    case 6:  return (uint64_t*)&ctx->Rsi;
-    case 7:  return (uint64_t*)&ctx->Rdi;
-    case 8:  return (uint64_t*)&ctx->R8;
-    case 9:  return (uint64_t*)&ctx->R9;
-    case 10: return (uint64_t*)&ctx->R10;
-    case 11: return (uint64_t*)&ctx->R11;
-    case 12: return (uint64_t*)&ctx->R12;
-    case 13: return (uint64_t*)&ctx->R13;
-    case 14: return (uint64_t*)&ctx->R14;
-    case 15: return (uint64_t*)&ctx->R15;
-    default: return NULL;
-    }
-}
-
-static int decode_modrm_len(const uint8_t *ip, int has_rex_b)
-{
-    uint8_t modrm = *ip;
-    int mod = (modrm >> 6) & 3;
-    int rm = (modrm & 7) | (has_rex_b ? 8 : 0);
-    int len = 1;
-
-    if (mod == 3) return 1;
-    if ((rm & 7) == 4) {
-        len += 1;                               /* SIB */
-        /* mod==0 with SIB.base==5 has no base register and a disp32 instead.
-         * Missing it under-counted the instruction length, so RIP resumed
-         * inside the operand. */
-        if (mod == 0 && (ip[1] & 7) == 5) len += 4;
-    }
-    if (mod == 0 && (rm & 7) == 5) len += 4; /* disp32, no SIB */
-    else if (mod == 1) len += 1;
-    else if (mod == 2) len += 4;
-    return len;
-}
-
-/* ============================================================
  * Instruction decoder for APU MMIO access
  * ============================================================ */
 
+static uint64_t apu_rd(void *dev, uint32_t off, int size)
+{
+    g_apu_mmio_read_count++;
+    return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, size);
+}
+
+static void apu_wr(void *dev, uint32_t off, uint64_t val, int size)
+{
+    g_apu_mmio_write_count++;
+    mcpx_apu_mmio_write((MCPXAPUState *)dev, off, val, size);
+}
+
+/* The faulting instruction against the APU's registers, through the shared
+ * decoder (platform/mmio_decode.h), which knows the read-modify-write forms a
+ * compiler may fuse a volatile |= into. */
 static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
-    if (!g_apu_state) return false;
 
-    int prefix_len = 0;
-    int has_66 = 0;
-    int rex = 0, has_rex = 0;
-
-    while (1) {
-        uint8_t b = ip[prefix_len];
-        if (b == 0x66) { has_66 = 1; prefix_len++; }
-        else if (b == 0xF2 || b == 0xF3) { prefix_len++; }
-        else if (b >= 0x40 && b <= 0x4F) { rex = b; has_rex = 1; prefix_len++; }
-        else break;
-    }
-
-    int rex_w = has_rex && (rex & 0x08);
-    int rex_r = has_rex && (rex & 0x04);
-    int rex_b = has_rex && (rex & 0x01);
-
-    const uint8_t *opcode = ip + prefix_len;
-    int access_size = 4;
-    if (has_66) access_size = 2;
-    if (rex_w) access_size = 8;
-
-    /* MOV r/m, r (write: 88/89) */
-    if (opcode[0] == 0x89 || opcode[0] == 0x88) {
-        if (opcode[0] == 0x88) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = *ctx_reg64(ctx, reg);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, val, access_size);
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_write_count++;
+    (void)is_write;
+    if (!g_apu_state)
+        return false;
+    if (mmio_emulate(ctx, mmio_offset, g_apu_state, apu_rd, apu_wr))
         return true;
-    }
-
-    /* MOV r/m, imm (write: C7 /0)
-     *
-     * The immediate is 16-bit under a 0x66 prefix and 32-bit otherwise -- it
-     * is never 64-bit, even with REX.W, which sign-extends imm32. Reading 4
-     * bytes for the 16-bit form took two bytes of the next instruction as
-     * part of the value and then resumed RIP two bytes past it. */
-    if (opcode[0] == 0xC7) {
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int imm_len = has_66 ? 2 : 4;
-        uint32_t imm = has_66
-            ? *(const uint16_t *)(opcode + 1 + modrm_len)
-            : *(const uint32_t *)(opcode + 1 + modrm_len);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, imm, access_size);
-        ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
-        g_apu_mmio_write_count++;
-        return true;
-    }
-
-    /* MOV r/m8, imm8 (write: C6 /0) */
-    if (opcode[0] == 0xC6) {
-        access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        uint8_t imm = *(opcode + 1 + modrm_len);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, imm, 1);
-        ctx->Rip += prefix_len + 1 + modrm_len + 1;
-        g_apu_mmio_write_count++;
-        return true;
-    }
-
-    /* MOV r, r/m (read: 8A/8B) */
-    if (opcode[0] == 0x8B || opcode[0] == 0x8A) {
-        if (opcode[0] == 0x8A) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t *dst = ctx_reg64(ctx, reg);
-        if (access_size == 1) *dst = (*dst & ~0xFFULL) | (val & 0xFF);
-        else if (access_size == 2) *dst = (*dst & ~0xFFFFULL) | (val & 0xFFFF);
-        else if (access_size == 4) *dst = val & 0xFFFFFFFF;
-        else *dst = val;
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
-
-    /* MOVZX r32, r/m8 (0F B6) */
-    if (opcode[0] == 0x0F && opcode[1] == 0xB6) {
-        access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 2, rex_b);
-        int reg = ((opcode[2] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, 1);
-        *ctx_reg64(ctx, reg) = val & 0xFF;
-        ctx->Rip += prefix_len + 2 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
-
-    /* MOVZX r32, r/m16 (0F B7) */
-    if (opcode[0] == 0x0F && opcode[1] == 0xB7) {
-        access_size = 2;
-        int modrm_len = decode_modrm_len(opcode + 2, rex_b);
-        int reg = ((opcode[2] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, 2);
-        *ctx_reg64(ctx, reg) = val & 0xFFFF;
-        ctx->Rip += prefix_len + 2 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
-
-    /* TEST r/m, r (84/85) - read */
-    if (opcode[0] == 0x85 || opcode[0] == 0x84) {
-        if (opcode[0] == 0x84) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        uint64_t result = mem_val & reg_val;
-        ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800);
-        if (result == 0) ctx->EFlags |= 0x0040;
-        if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080;
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
-
-    /* CMP r/m, r (38/39) */
-    if (opcode[0] == 0x39 || opcode[0] == 0x38) {
-        if (opcode[0] == 0x38) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        if (access_size <= 4) {
-            mem_val &= (1ULL << (access_size * 8)) - 1;
-            reg_val &= (1ULL << (access_size * 8)) - 1;
-        }
-        uint64_t result = mem_val - reg_val;
-        ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800);
-        if (result == 0) ctx->EFlags |= 0x0040;
-        if (mem_val < reg_val) ctx->EFlags |= 0x0001;
-        if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080;
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
-
-    /* OR r/m, r (08/09) */
-    if (opcode[0] == 0x09 || opcode[0] == 0x08) {
-        if (opcode[0] == 0x08) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, mem_val | reg_val, access_size);
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_write_count++;
-        return true;
-    }
-
-    /* AND r/m, r (20/21) */
-    if (opcode[0] == 0x21 || opcode[0] == 0x20) {
-        if (opcode[0] == 0x20) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, mem_val & reg_val, access_size);
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_write_count++;
-        return true;
-    }
-
-    /* Unrecognized */
     g_apu_mmio_decode_fail++;
     if (g_apu_mmio_decode_fail <= 20) {
         fprintf(stderr, "[APU] MMIO decode fail at RIP=%p offset=0x%X: %02X %02X %02X %02X %02X %02X\n",
@@ -372,9 +177,27 @@ static int ac97_store(void *dst, uint64_t value, int size)
  * NV2A interrupt status: write-1-to-clear
  * ============================================================ */
 
-/* Defined below, next to the AC'97 handler it is shared with. */
-static int mmio_decode_write_value(PCONTEXT ctx, uint64_t *out, int *out_size);
-static int ac97_store(void *dst, uint64_t value, int size);
+/* A write-trapped page reads as memory: the decoder's reads come straight
+ * from the page, and its one write goes to the handler's semantics. */
+typedef struct {
+    uintptr_t host_addr;        /* where the faulting access lands */
+    uint32_t  offset;           /* the register it lands on */
+    uintptr_t aperture;         /* NV2A: the register window's host base */
+    int       ok;               /* the semantic store succeeded */
+} TrappedWrite;
+
+static uint64_t trapped_rd(void *dev, uint32_t off, int size)
+{
+    const TrappedWrite *t = (const TrappedWrite *)dev;
+    (void)off;
+    switch (size) {
+    case 1:  return *(const volatile uint8_t  *)t->host_addr;
+    case 2:  return *(const volatile uint16_t *)t->host_addr;
+    case 8:  return *(const volatile uint64_t *)t->host_addr;
+    default: return *(const volatile uint32_t *)t->host_addr;
+    }
+}
+
 
 /* The registers a guest ISR acknowledges through, and the summary bit.
  *
@@ -405,194 +228,82 @@ static int ac97_store(void *dst, uint64_t value, int size);
 #define NV2A_PMC_INTR_PCRTC_BIT  0x01000000u
 #define NV2A_PCRTC_INTR_0_OFF    0x600100u
 
-int nv2a_intr_handle_write(PCONTEXT ctx, uintptr_t host_addr,
-                           uint32_t nv2a_offset, uintptr_t aperture)
+/* The semantics, given the value and width the instruction stores. */
+static void nv2a_intr_wr(void *dev, uint32_t off, uint64_t written, int size)
 {
+    TrappedWrite *t = (TrappedWrite *)dev;
     volatile uint32_t *pmc =
-        (volatile uint32_t *)(aperture + NV2A_PMC_INTR_0_OFF);
+        (volatile uint32_t *)(t->aperture + NV2A_PMC_INTR_0_OFF);
     volatile uint32_t *pcrtc =
-        (volatile uint32_t *)(aperture + NV2A_PCRTC_INTR_0_OFF);
-    uint64_t written;
-    int size;
+        (volatile uint32_t *)(t->aperture + NV2A_PCRTC_INTR_0_OFF);
 
-    if (!mmio_decode_write_value(ctx, &written, &size))
-        return 0;
-
-    if (nv2a_offset == NV2A_PCRTC_INTR_0_OFF) {
+    (void)off;
+    if (t->offset == NV2A_PCRTC_INTR_0_OFF) {
         uint32_t remaining = *pcrtc & ~(uint32_t)written;
-        if (!ac97_store((void *)host_addr, remaining, 4))
-            return 0;
+        if (!ac97_store((void *)t->host_addr, remaining, 4))
+            return;
         /* The summary follows the unit, and nothing else owns that bit. */
         if (remaining)
             *pmc |= NV2A_PMC_INTR_PCRTC_BIT;
         else
             *pmc &= ~NV2A_PMC_INTR_PCRTC_BIT;
-        return 1;
+        t->ok = 1;
+        return;
     }
-
-    if (nv2a_offset == NV2A_PMC_INTR_0_OFF) {
+    if (t->offset == NV2A_PMC_INTR_0_OFF) {
         /* PMC_INTR_0 is read-only status on hardware. A driver that writes it
          * is acknowledging, so drop the written bits rather than storing
          * them. */
         uint32_t remaining = *pmc & ~(uint32_t)written;
-        return ac97_store((void *)host_addr, remaining, 4);
+        t->ok = ac97_store((void *)t->host_addr, remaining, 4);
+        return;
     }
-
     /* Any other register on the page: a plain store, so the page behaves as
      * memory for everything this does not model. */
-    return ac97_store((void *)host_addr, written, size);
+    t->ok = ac97_store((void *)t->host_addr, written, size);
 }
 
-/* Decode the value and width a faulting store was going to write.
- *
- * Shared by the AC'97 and NV2A handlers, which differ only in what they do
- * with the value. Returns 0 for a form the decoder does not know, and the
- * caller must then let the fault through -- silently skipping an instruction
- * whose width is a guess is how a wrong RIP happens.
- */
-static int mmio_decode_write_value(PCONTEXT ctx, uint64_t *out, int *out_size)
+int nv2a_intr_handle_write(PCONTEXT ctx, uintptr_t host_addr,
+                           uint32_t nv2a_offset, uintptr_t aperture)
 {
-    const uint8_t *ip = (const uint8_t *)ctx->Rip;
-    int prefix_len = 0, has_66 = 0, rex = 0, has_rex = 0;
-    int rex_w, rex_r, rex_b, size;
-    const uint8_t *opcode;
+    TrappedWrite t;
+    CONTEXT saved = *ctx;
 
-    while (1) {
-        uint8_t b = ip[prefix_len];
-        if (b == 0x66) { has_66 = 1; prefix_len++; }
-        else if (b == 0xF2 || b == 0xF3) { prefix_len++; }
-        else if (b >= 0x40 && b <= 0x4F) { rex = b; has_rex = 1; prefix_len++; }
-        else break;
+    t.host_addr = host_addr;
+    t.offset = nv2a_offset;
+    t.aperture = aperture;
+    t.ok = 0;
+    if (!mmio_emulate(ctx, nv2a_offset, &t, trapped_rd, nv2a_intr_wr))
+        return 0;
+    if (!t.ok) {
+        *ctx = saved;               /* the store did not happen: let it fault */
+        return 0;
     }
-    rex_w = has_rex && (rex & 0x08);
-    rex_r = has_rex && (rex & 0x04);
-    rex_b = has_rex && (rex & 0x01);
-
-    opcode = ip + prefix_len;
-    size = 4;
-    if (has_66) size = 2;
-    if (rex_w)  size = 8;
-
-    if (opcode[0] == 0x89 || opcode[0] == 0x88) {
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        if (opcode[0] == 0x88) size = 1;
-        *out = *ctx_reg64(ctx, reg);
-        *out_size = size;
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        return 1;
-    }
-    if (opcode[0] == 0xC7) {
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int imm_len = has_66 ? 2 : 4;
-        *out = has_66 ? *(const uint16_t *)(opcode + 1 + modrm_len)
-                      : *(const uint32_t *)(opcode + 1 + modrm_len);
-        *out_size = size;
-        ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
-        return 1;
-    }
-    if (opcode[0] == 0xC6) {
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        *out = *(opcode + 1 + modrm_len);
-        *out_size = 1;
-        ctx->Rip += prefix_len + 1 + modrm_len + 1;
-        return 1;
-    }
-    return 0;
+    return 1;
 }
 
+static void ac97_wr(void *dev, uint32_t off, uint64_t value, int size)
+{
+    TrappedWrite *t = (TrappedWrite *)dev;
+    t->ok = ac97_store((void *)t->host_addr, ac97_apply_mask(off, value), size);
+}
+
+/* Any store form, read-modify-writes included (the guest clears the control
+ * register with `and byte [cr], 0`): the page reads as memory, and the store
+ * goes through the reset-bit mask. */
 int mcpx_ac97_handle_write(PCONTEXT ctx, uintptr_t host_addr, uint32_t mcpx_offset)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
-    int prefix_len = 0, has_66 = 0, rex = 0, has_rex = 0;
-    int rex_w, rex_r, rex_b, access_size;
-    const uint8_t *opcode;
+    TrappedWrite t;
+    CONTEXT saved = *ctx;
 
-    while (1) {
-        uint8_t b = ip[prefix_len];
-        if (b == 0x66) { has_66 = 1; prefix_len++; }
-        else if (b == 0xF2 || b == 0xF3) { prefix_len++; }
-        else if (b >= 0x40 && b <= 0x4F) { rex = b; has_rex = 1; prefix_len++; }
-        else break;
-    }
-    rex_w = has_rex && (rex & 0x08);
-    rex_r = has_rex && (rex & 0x04);
-    rex_b = has_rex && (rex & 0x01);
-
-    opcode = ip + prefix_len;
-    access_size = 4;
-    if (has_66) access_size = 2;
-    if (rex_w)  access_size = 8;
-
-    /* MOV r/m, r */
-    if (opcode[0] == 0x89 || opcode[0] == 0x88) {
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = *ctx_reg64(ctx, reg);
-        if (opcode[0] == 0x88) access_size = 1;
-        if (!ac97_store((void *)host_addr,
-                        ac97_apply_mask(mcpx_offset, val), access_size))
-            return 0;
-        ctx->Rip += prefix_len + 1 + modrm_len;
+    t.host_addr = host_addr;
+    t.offset = mcpx_offset;
+    t.aperture = 0;
+    t.ok = 0;
+    if (mmio_emulate(ctx, mcpx_offset, &t, trapped_rd, ac97_wr) && t.ok)
         return 1;
-    }
-
-    /* MOV r/m, imm -- 16-bit immediate under a 0x66 prefix, else 32-bit */
-    if (opcode[0] == 0xC7) {
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int imm_len = has_66 ? 2 : 4;
-        uint32_t imm = has_66
-            ? *(const uint16_t *)(opcode + 1 + modrm_len)
-            : *(const uint32_t *)(opcode + 1 + modrm_len);
-        if (!ac97_store((void *)host_addr,
-                        ac97_apply_mask(mcpx_offset, imm), access_size))
-            return 0;
-        ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
-        return 1;
-    }
-
-    /* Group 1 on a byte: op r/m8, imm8 (80 /r).
-     *
-     * The guest clears the register with `and byte [cr], 0`, which lands here
-     * rather than in the MOV forms. It only reached the MOV path at all
-     * because MEM8 is volatile, so MSVC could not fuse the lifted read and
-     * write into one RMW -- a compiler that did would have crashed on an
-     * unhandled form. Reading is allowed on this page, so a read-modify-write
-     * is straightforward. */
-    if (opcode[0] == 0x80) {
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int op = (opcode[1] >> 3) & 7;
-        uint8_t imm = *(opcode + 1 + modrm_len);
-        uint8_t cur = *(const volatile uint8_t *)host_addr;
-        uint8_t val;
-
-        switch (op) {
-        case 0: val = (uint8_t)(cur + imm); break;   /* ADD */
-        case 1: val = (uint8_t)(cur | imm); break;   /* OR  */
-        case 4: val = (uint8_t)(cur & imm); break;   /* AND */
-        case 5: val = (uint8_t)(cur - imm); break;   /* SUB */
-        case 6: val = (uint8_t)(cur ^ imm); break;   /* XOR */
-        case 7: return 0;                            /* CMP writes nothing */
-        default: return 0;                           /* ADC/SBB need the carry */
-        }
-        if (!ac97_store((void *)host_addr,
-                        ac97_apply_mask(mcpx_offset, val), 1))
-            return 0;
-        ctx->Rip += prefix_len + 1 + modrm_len + 1;
-        return 1;
-    }
-
-    /* MOV r/m8, imm8 -- how the control register is normally set */
-    if (opcode[0] == 0xC6) {
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        uint8_t imm = *(opcode + 1 + modrm_len);
-        if (!ac97_store((void *)host_addr,
-                        ac97_apply_mask(mcpx_offset, imm), 1))
-            return 0;
-        ctx->Rip += prefix_len + 1 + modrm_len + 1;
-        return 1;
-    }
-
+    *ctx = saved;
     {
         static unsigned said;
         if (said++ < 20) {
@@ -636,4 +347,3 @@ int apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     return ok;
 }
 
-#endif /* _WIN32 */

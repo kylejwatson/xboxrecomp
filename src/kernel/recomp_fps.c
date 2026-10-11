@@ -22,8 +22,7 @@
  * swap and one per vblank.
  */
 
-#ifdef _WIN32
-#include <windows.h>
+#include "platform/xbox_winnt.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -226,17 +225,24 @@ static DWORD WINAPI fps_reporter(LPVOID param)
     prev_vblanks = base_vblanks = InterlockedCompareExchange64(&s_vblanks, 0, 0);
 
     /* Sleep is only a wake-up call here; the window is measured, not assumed. */
+#ifdef _WIN32
     timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+#else
+    timer = NULL;                        /* Sleep is precise enough here */
+#endif
     for (;;) {
         LONG64 swaps, vblanks;
         double window, elapsed;
 
+#ifdef _WIN32
         if (timer) {
             LARGE_INTEGER due;
             due.QuadPart = -(LONGLONG)(secs * 10000000.0);
             SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
             WaitForSingleObject(timer, INFINITE);
-        } else {
+        } else
+#endif
+        {
             Sleep((DWORD)(secs * 1000.0));
         }
 
@@ -428,14 +434,4 @@ void xbox_FpsCountVblank(void)
     InterlockedIncrement64(&s_vblanks);
 }
 
-#else  /* !_WIN32 */
 
-void xbox_FpsCountSwap(void)   {}
-int  xbox_FpsWaitProfileOn(void) { return 0; }
-void xbox_FpsNoteKernel(unsigned ordinal, long long ticks, uint32_t object)
-{ (void)ordinal; (void)ticks; (void)object; }
-void xbox_FpsNoteSet(uint32_t object, int was_signalled)
-{ (void)object; (void)was_signalled; }
-void xbox_FpsCountVblank(void) {}
-
-#endif

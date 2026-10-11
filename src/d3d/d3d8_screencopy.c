@@ -24,6 +24,7 @@
 #include "d3d8_xbox.h"
 
 #include <d3dcompiler.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 

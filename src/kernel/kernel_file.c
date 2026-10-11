@@ -14,7 +14,9 @@
  * are identical on both; only the host syscalls differ.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
+#endif
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
@@ -837,8 +839,18 @@ static ULONG mode_to_xbox_attrs(mode_t m)
     return a;
 }
 
+/* The last failure as the Win32 error the bridge's [FILE] line names. */
+static __thread uint32_t s_last_file_error;
+
+uint32_t xbox_LastFileError(void)
+{
+    return s_last_file_error;
+}
+
 static NTSTATUS errno_to_status(int e)
 {
+    s_last_file_error = e == ENOENT ? 2u : e == ENOTDIR ? 3u : e == EEXIST ? 80u :
+                        (e == EACCES || e == EPERM) ? 5u : (uint32_t)e;
     switch (e) {
         case ENOENT:  return STATUS_OBJECT_NAME_NOT_FOUND;
         case ENOTDIR: return STATUS_OBJECT_PATH_NOT_FOUND;
@@ -850,41 +862,106 @@ static NTSTATUS errno_to_status(int e)
     }
 }
 
+/* The Xbox path an object refers to, as a host path. A path relative to a
+ * RootDirectory handle (XDeleteSaveGame opens each child relative to its save
+ * directory) is joined to the path that handle was opened with. */
+static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+                               char *host_path, DWORD buf_size)
+{
+    const char *xbox_path = get_xbox_path(ObjectAttributes);
+    if (!xbox_path)
+        return FALSE;
+    if (ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
+        !(xbox_path[0] && xbox_path[1] == ':')) {
+        const char *root = w32_handle_path(ObjectAttributes->RootDirectory);
+        size_t n;
+        if (!root)
+            return FALSE;
+        snprintf(host_path, buf_size, "%s/%s", root, xbox_path);
+        for (n = strlen(root) + 1; host_path[n]; n++)
+            if (host_path[n] == '\\')
+                host_path[n] = '/';
+        return TRUE;
+    }
+    return xbox_translate_path(xbox_path, host_path, buf_size);
+}
+
+/* Each special case below is the Windows backend's, for the same title. */
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
     ULONG CreateDisposition, ULONG CreateOptions)
 {
-    char host_path[MAX_PATH];
+    char host_path[MAX_PATH * 2];
+    struct stat st;
+    int fd;
     (void)AllocationSize; (void)FileAttributes; (void)ShareAccess;
 
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
+    if (!translate_obj_path(ObjectAttributes, host_path, sizeof host_path)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
-    int fd;
+    /* A partition device opened as a directory: a free-space query wants
+     * the volume, and the image file's directory answers for it. */
+    if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        stat(host_path, &st) == 0 && !S_ISDIR(st.st_mode)) {
+        char *slash = strrchr(host_path, '/');
+        if (slash && slash != host_path) {
+            *slash = 0;
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                     "NtCreateFile: directory open of a device image, "
+                     "using its containing directory instead");
+        }
+    }
+
+    /* A device opened as itself ("\Device\CdRom0" is the game directory):
+     * an existing directory is opened as one, for IOCTLs and volume queries. */
+    if (!(CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        stat(host_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        CreateOptions |= XBOX_FILE_DIRECTORY_FILE;
+        xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                 "NtCreateFile: %s is a directory, opened as a device handle", host_path);
+    }
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
-            mkdir(host_path, 0755);   /* EEXIST is fine */
+        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF) {
+            if (mkdir(host_path, 0755) != 0 && errno == EEXIST &&
+                CreateDisposition == XBOX_FILE_CREATE) {
+                /* FILE_CREATE on an existing directory is a collision on the
+                 * console, and a title's save path depends on hearing it
+                 * (TimeSplitters 2's overwrite path). */
+                s_last_file_error = 183u;          /* ERROR_ALREADY_EXISTS */
+                xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                         "NtCreateFile: FILE_CREATE on existing directory %s -> collision",
+                         host_path);
+                if (IoStatusBlock) {
+                    IoStatusBlock->Status = STATUS_OBJECT_NAME_COLLISION;
+                    IoStatusBlock->Information = 0;
+                }
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+        }
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
         fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
     }
 
     if (fd < 0) {
-        int e = errno;
-        XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+        NTSTATUS status = errno_to_status(errno);
+        /* A warning, not a trace: a failed open is how a title silently
+         * decides a volume or asset is missing. */
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtCreateFile FAILED: %s (err=%u)",
+                 host_path, s_last_file_error);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = status;
             IoStatusBlock->Information = 0;
         }
-        return errno_to_status(e);
+        return status;
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
@@ -911,10 +988,16 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_INVALID_HANDLE;
     }
 
-    if (ByteOffset && ByteOffset->QuadPart >= 0)
-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
-
-    ssize_t n = read(fd, Buffer, Length);
+    /* At an offset: one positioned read (two threads may share a handle),
+     * and the file pointer left after it, as Windows' ReadFile leaves it. */
+    ssize_t n;
+    if (ByteOffset && ByteOffset->QuadPart >= 0) {
+        n = pread(fd, Buffer, Length, (off_t)ByteOffset->QuadPart);
+        if (n >= 0)
+            lseek(fd, (off_t)ByteOffset->QuadPart + n, SEEK_SET);
+    } else {
+        n = read(fd, Buffer, Length);
+    }
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -947,10 +1030,14 @@ NTSTATUS __stdcall xbox_NtWriteFile(
         return STATUS_INVALID_HANDLE;
     }
 
-    if (ByteOffset && ByteOffset->QuadPart >= 0)
-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
-
-    ssize_t n = write(fd, Buffer, Length);
+    ssize_t n;
+    if (ByteOffset && ByteOffset->QuadPart >= 0) {
+        n = pwrite(fd, Buffer, Length, (off_t)ByteOffset->QuadPart);
+        if (n >= 0)
+            lseek(fd, (off_t)ByteOffset->QuadPart + n, SEEK_SET);
+    } else {
+        n = write(fd, Buffer, Length);
+    }
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -976,9 +1063,8 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
-    char host_path[MAX_PATH];
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+    char host_path[MAX_PATH * 2];
+    if (!translate_obj_path(ObjectAttributes, host_path, sizeof host_path))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
     if (unlink(host_path) == 0) return STATUS_SUCCESS;
@@ -1094,10 +1180,41 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
-        case XboxFileBasicInformation:
-            /* Setting file times is non-essential for the game; accept it. */
+        case XboxFileAllocationInformation: {
+            /* Reserve space without moving the end of file (Halo's save path
+             * asks before writing, and an unimplemented class failed it). */
+            PXBOX_FILE_END_OF_FILE_INFORMATION info =
+                (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            if (info->EndOfFile.QuadPart > 0 &&
+                fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, (off_t)info->EndOfFile.QuadPart) != 0) {
+                struct stat st;
+                if (fstat(fd, &st) == 0 && st.st_size < (off_t)info->EndOfFile.QuadPart &&
+                    ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
+                    xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "allocation: %s", strerror(errno));
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
+        }
+        case XboxFileBasicInformation: {
+            /* NT times are 100 ns since 1601; 0 means "leave it". */
+            PXBOX_FILE_BASIC_INFORMATION info = (PXBOX_FILE_BASIC_INFORMATION)FileInformation;
+            struct timespec ts[2];
+            const LARGE_INTEGER *src[2] = { &info->LastAccessTime, &info->LastWriteTime };
+            int k;
+            for (k = 0; k < 2; k++) {
+                if (src[k]->QuadPart <= 0) {
+                    ts[k].tv_sec = 0;
+                    ts[k].tv_nsec = UTIME_OMIT;
+                } else {
+                    long long t = src[k]->QuadPart - 116444736000000000LL;
+                    ts[k].tv_sec = (time_t)(t / 10000000LL);
+                    ts[k].tv_nsec = (long)(t % 10000000LL) * 100L;
+                }
+            }
+            futimens(fd, ts);
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
         default:
             /* stderr, not xbox_log: WARN is filtered out by default, and an
              * unimplemented info class is exactly the kind of silent gap that
@@ -1164,13 +1281,12 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     PXBOX_FILE_NETWORK_OPEN_INFORMATION FileInformation)
 {
-    char host_path[MAX_PATH];
+    char host_path[MAX_PATH * 2];
     struct stat st;
 
     if (!FileInformation)
         return STATUS_INVALID_PARAMETER;
-    const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
+    if (!translate_obj_path(ObjectAttributes, host_path, sizeof host_path))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     if (stat(host_path, &st) != 0)
         return STATUS_OBJECT_NAME_NOT_FOUND;

@@ -30,6 +30,10 @@
 #  endif
 #  include <windows.h>
 #  include <xinput.h>
+#else
+/* GetAsyncKeyState, GetForegroundWindow and XInputGetState, answered by the
+ * SDL window and gamepads (src/platform/host_sdl.c). */
+#  include "platform/xbox_winnt.h"
 #endif
 
 #define MAX_SOURCES 4
@@ -683,21 +687,23 @@ static int find_config(char *out, size_t n)
     snprintf(out, n, "input_bindings.json");
     if (readable(out))
         return 1;
-#if defined(_WIN32)
     /* Beside the executable itself, whatever the working directory: a
      * shortcut or a launcher may start it from somewhere else. */
     {
-        char exe[MAX_PATH];
+        char exe[1024];
         DWORD len = GetModuleFileNameA(NULL, exe, sizeof exe);
+#if defined(_WIN32)
         char *slash = len && len < sizeof exe ? strrchr(exe, '\\') : NULL;
+#else
+        char *slash = len && len < sizeof exe ? strrchr(exe, '/') : NULL;
+#endif
         if (slash) {
-            *slash = '\0';
-            snprintf(out, n, "%s\\input_bindings.json", exe);
+            slash[1] = '\0';
+            snprintf(out, n, "%sinput_bindings.json", exe);
             if (readable(out))
                 return 1;
         }
     }
-#endif
     return 0;
 }
 
@@ -844,7 +850,8 @@ const char *recomp_bindings_device_name(unsigned port)
 
 /* ---- reading the host -------------------------------------------------- */
 
-#if defined(_WIN32)
+/* The Win32 calls below are Windows' own there, and the SDL host's elsewhere
+ * (GetAsyncKeyState, GetForegroundWindow, XInputGetState: host_sdl.c). */
 
 /* Whether this process owns the foreground window. GetAsyncKeyState and
  * XInputGetState are global: without this check the title reads every key
@@ -1116,22 +1123,4 @@ unsigned recomp_bindings_present_mask(void)
     return mask;
 }
 
-#else /* not Windows: nothing to read from yet, but the config still parses */
 
-int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
-{
-    recomp_bindings_init();
-    if (!out)
-        return 0;
-    memset(out, 0, sizeof *out);
-    (void)port;
-    return 0;
-}
-
-unsigned recomp_bindings_present_mask(void)
-{
-    recomp_bindings_init();
-    return g_ctl[0].device != DEV_NONE ? 1u : 0u;
-}
-
-#endif

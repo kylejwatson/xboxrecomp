@@ -31,7 +31,7 @@
 #include <string.h>
 #include "hle.h"
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 #include "d3d8_xbox.h"
 #include "d3d8_vsh.h"
 #include "hle_d3d8_record.h"
@@ -526,8 +526,8 @@ const void *hle_d3d8_title_vertices(uint32_t first, uint32_t vertices,
                                     uint32_t stream_base, uint32_t stream_stride,
                                     uint32_t *stride_out)
 {
-    static __declspec(thread) uint8_t *buf;
-    static __declspec(thread) size_t cap;
+    static RECOMP_TLS uint8_t *buf;
+    static RECOMP_TLS size_t cap;
     uint32_t object = hle_d3d8_shadow_program_object(), extent = 0, stride, i, v;
     uint32_t doff[NV_ATTRS], dsize[NV_ATTRS];
     size_t need;
@@ -624,4 +624,4 @@ const void *hle_d3d8_title_vertices(uint32_t first, uint32_t vertices,
     return buf;
 }
 
-#endif /* _WIN32 */
+#endif /* HLE_HOST_RENDERER */

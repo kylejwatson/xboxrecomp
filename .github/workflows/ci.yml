@@ -52,7 +52,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build pkg-config libsdl2-dev libepoxy-dev libssl-dev
+            ninja-build pkg-config libsdl2-dev libssl-dev libvulkan-dev \
+            libshaderc-dev glslc libfreetype-dev libfontconfig-dev
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug

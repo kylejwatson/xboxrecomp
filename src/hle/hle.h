@@ -32,6 +32,13 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* Marks an implementation, and names it hle_<name>. */
 #define HLE_EXPORT(name) void hle_##name(void)
 
+/* The host renderer (src/d3d) is linked and the D3D8 replacements may drive
+ * it: Direct3D 11 on Windows, Vulkan elsewhere. 0 builds the replacements as
+ * pass-throughs that run only the title's own bodies. */
+#ifndef HLE_HOST_RENDERER
+#define HLE_HOST_RENDERER 1
+#endif
+
 /* Imports an XDK variable's guest address by name, as hle_var_<name>. Must
  * start a line, like HLE_EXPORT: tools.recomp scans for the marker and writes
  * the definition into recomp_hle.c from the title's XDK symbols. 0 means the

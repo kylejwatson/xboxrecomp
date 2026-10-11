@@ -18,7 +18,9 @@ OS_RELEASE="${OS_RELEASE:-/etc/os-release}"
 # Same dependencies throughout, spelled per distro:
 #   build toolchain + cmake + pkg-config
 #   SDL2    - window, input, audio
-#   OpenGL headers + libepoxy - GL loader for the d3d8 backend
+#   Vulkan headers + loader, shaderc - the renderer (src/d3d/vk) and its
+#             HLSL -> SPIR-V compiler
+#   FreeType + fontconfig - the F9 overlay's text
 #   OpenSSL - crypto, replaces bcrypt
 #   ffmpeg  - video decode/demux/scale
 detect_family() {
@@ -37,16 +39,17 @@ detect_family() {
 
 family=$(detect_family) || {
     echo "Could not identify the distro from $OS_RELEASE." >&2
-    echo "Install these by hand: a C toolchain, cmake, pkg-config, SDL2," >&2
-    echo "OpenGL headers, libepoxy, OpenSSL, and ffmpeg (all with headers)." >&2
+    echo "Install these by hand: a C toolchain, cmake, ninja, pkg-config, SDL2," >&2
+    echo "Vulkan headers and loader, shaderc, FreeType, fontconfig, OpenSSL and" >&2
+    echo "ffmpeg (all with headers), plus a Vulkan 1.3 driver." >&2
     exit 1
 }
 
 case "$family" in
     debian)
-        PKGS=(cmake build-essential pkg-config libsdl2-dev libgl1-mesa-dev
-              libepoxy-dev libssl-dev libavcodec-dev libavformat-dev
-              libavutil-dev libswscale-dev)
+        PKGS=(cmake ninja-build build-essential pkg-config libsdl2-dev
+              libvulkan-dev libshaderc-dev glslc libfreetype-dev libfontconfig-dev
+              libssl-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev)
         echo "Detected Debian/Ubuntu. Installing ${#PKGS[@]} packages..."
         sudo apt-get update
         sudo apt-get install -y "${PKGS[@]}"
@@ -54,13 +57,15 @@ case "$family" in
     arch)
         # base-devel covers gcc/make/pkgconf; ffmpeg and mesa ship headers.
         # sdl2 resolves to sdl2-compat on current Arch.
-        PKGS=(base-devel cmake sdl2 mesa libepoxy openssl ffmpeg)
+        PKGS=(base-devel cmake ninja sdl2 vulkan-headers vulkan-icd-loader shaderc
+              freetype2 fontconfig openssl ffmpeg)
         echo "Detected Arch. Installing ${#PKGS[@]} packages..."
         sudo pacman -S --needed "${PKGS[@]}"
         ;;
     fedora)
-        PKGS=(cmake gcc make pkgconf-pkg-config SDL2-devel mesa-libGL-devel
-              libepoxy-devel openssl-devel ffmpeg-devel)
+        PKGS=(cmake ninja-build gcc make pkgconf-pkg-config SDL2-devel
+              vulkan-headers vulkan-loader-devel libshaderc-devel freetype-devel
+              fontconfig-devel openssl-devel ffmpeg-devel)
         echo "Detected Fedora/RHEL. Installing ${#PKGS[@]} packages..."
         echo "(ffmpeg-devel needs RPM Fusion enabled.)"
         sudo dnf install -y "${PKGS[@]}"

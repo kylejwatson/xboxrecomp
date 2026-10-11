@@ -3041,7 +3041,7 @@ static void contig_remove(int i)
     g_contig_block_count--;
 }
 
-uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+static uint32_t xbox_ContiguousAlloc_unlocked(uint32_t size, uint32_t alignment)
 {
     uint32_t result, span;
     int i;
@@ -3110,7 +3110,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 /* MmFreeContiguousMemory. Returns 0 when `xbox_va` is not the start of a live
  * block this arena handed out (a pinned MmAllocateContiguousMemoryEx address,
  * say), which the caller may then treat as not contiguous at all. */
-int xbox_ContiguousFree(uint32_t xbox_va)
+static int xbox_ContiguousFree_unlocked(uint32_t xbox_va)
 {
     int i;
 
@@ -3181,7 +3181,7 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
 }
 
 
-uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+static uint32_t xbox_HeapAlloc_unlocked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -3324,7 +3324,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
  * forward is asking about the block that contains it. Returns 0 for an address
  * this heap never handed out, which is what "not one of mine" has to look like.
  */
-uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+static uint32_t xbox_HeapBlockSize_unlocked(uint32_t xbox_va)
 {
     int i;
 
@@ -3351,7 +3351,7 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
     return 0;
 }
 
-void xbox_HeapFree(uint32_t xbox_va)
+static void xbox_HeapFree_unlocked(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
 
@@ -3398,4 +3398,57 @@ void xbox_HeapFree(uint32_t xbox_va)
 HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
+}
+
+/* ── Allocator lock ─────────────────────────────────────────────────────
+ * The heap and contiguous arenas are tables and bump pointers with no lock of
+ * their own, and guest threads are real host threads: XAPI's start-up thread
+ * and the title's main thread allocate at the same moment, and two callers
+ * that both read g_heap_next hand out the same memory. It stayed hidden on
+ * Windows by timing alone; on Linux the title's first 1 MB heap landed on top
+ * of two live blocks and its allocator walked off into 0xFFFFFFF8. One lock
+ * for both arenas, since HeapBlockSize reads both. */
+static SRWLOCK g_alloc_lock = SRWLOCK_INIT;
+
+uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    r = xbox_ContiguousAlloc_unlocked(size, alignment);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+    return r;
+}
+
+int xbox_ContiguousFree(uint32_t xbox_va)
+{
+    int r;
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    r = xbox_ContiguousFree_unlocked(xbox_va);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+    return r;
+}
+
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    r = xbox_HeapAlloc_unlocked(size, alignment);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+    return r;
+}
+
+uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    r = xbox_HeapBlockSize_unlocked(xbox_va);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+    return r;
+}
+
+void xbox_HeapFree(uint32_t xbox_va)
+{
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    xbox_HeapFree_unlocked(xbox_va);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
 }

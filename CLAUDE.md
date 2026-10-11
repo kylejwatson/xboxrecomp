@@ -207,6 +207,22 @@ seam goes *inside* `src/d3d` as an RHI, not at the COM vtable — `d3d8_gl.c` is
 proof of what the vtable seam costs, and it should be deleted once Vulkan can replay a
 frame. Read §4.4 before touching the winding, and §4.10 before choosing a present mode.
 
+**Linux, Oct 2026: done, at the D3D11 API rather than as an RHI.** On non-Windows
+hosts `src/d3d/vk/d3d11_vk.c` implements the 61 D3D11 entry points `src/d3d`
+calls on Vulkan 1.3 (with `vk/include/` standing in for `<d3d11.h>`, `<dxgi.h>`,
+`<d3dcompiler.h>`), so every line of Xbox knowledge in `src/d3d` is shared and
+the Windows backend did not move. `D3DCompile` is shaderc (glslang's HLSL front
+end, not DXC); stages and input layouts link by HLSL semantic. FP plays at 60 fps
+on RADV. **Correction to vulkan-backend.md 4.4:** with a negative viewport height
+the framebuffer positions are D3D's, so the on-screen winding is too --
+`FrontCounterClockwise` maps straight to `frontFace`, no inversion. The platform
+side (`src/platform`) now has a real `CONTEXT` and VEH on sigaction, an SDL host
+(`host_sdl.c`: window, keys, pads behind the Win32 calls), and `src/hle` has an
+SDL audio backend; `d3d8_gl.c` is no longer built. Two things the port found
+that were wrong everywhere: the heap allocators had no lock, and the MMIO trap
+decoders knew only MOV, while GCC/Clang fuse a volatile `|=` into `or [mem], imm`
+(`platform/mmio_decode.h` now handles the RMW forms).
+
 The A/B problem is solved: **frame capture and replay** (`src/hle/d3d8_capture.h`,
 `src/replay`) records one frame's host calls and plays them back with no game running, so
 one frame can be drawn by two backends and compared. That is the bring-up loop for a Vulkan
@@ -276,6 +292,9 @@ from the mapped XBE, keeps `g_thunk_ordinals` only as a no-XBE fallback, and add
 ## Pipeline
 
 Tools run as Python modules from the repo root (`py -3` on Windows, `python3` on Linux).
+On Linux, build a title with clang or gcc; the title CMakeLists adds `-fwrapv
+-fno-strict-aliasing` for the lifted code and exports its symbols for the
+fault handler.
 
 ```
 extract-xiso  ->  tools.xbe_parser  ->  tools.disasm  ->  tools.func_id

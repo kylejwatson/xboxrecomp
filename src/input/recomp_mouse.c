@@ -545,11 +545,180 @@ int recomp_mouse_window_message(void *hwnd_ptr, unsigned msg, uintptr_t wp,
     }
 }
 
-#else   /* no window backend off Windows yet */
+#else   /* the SDL window (src/platform/host_sdl.c) */
+
+/* The same rules as the raw-input path above, on SDL: relative mouse mode is
+ * the capture (SDL hides the cursor, keeps it in the window and reports raw
+ * motion -- XInput2 on X11, the relative-pointer protocol on Wayland), a
+ * click on the picture takes the mouse, F8 lets it go, losing the focus lets
+ * it go and drops every button. Everything here runs on SDL's event thread,
+ * which is the thread allowed to change the relative mode. */
+#include <SDL.h>
+#include "platform/host_sdl.h"
+
+static SDL_Window *g_win;
+static int  g_attached;
+static long g_suppress;                 /* event thread only */
+
+static void wheel_notch(int dir, int notches)
+{
+    long n;
+
+    if (notches < 1)
+        notches = 1;
+    n = ATOMIC_ADD(&g_wheel_pending[dir], notches) + notches;
+    if (n > MOUSE_WHEEL_QUEUE)
+        ATOMIC_XCHG(&g_wheel_pending[dir], MOUSE_WHEEL_QUEUE);
+}
+
+static long button_bit(Uint8 b)
+{
+    switch (b) {
+    case SDL_BUTTON_LEFT:   return 1L << RECOMP_MOUSE_LEFT;
+    case SDL_BUTTON_RIGHT:  return 1L << RECOMP_MOUSE_RIGHT;
+    case SDL_BUTTON_MIDDLE: return 1L << RECOMP_MOUSE_MIDDLE;
+    case SDL_BUTTON_X1:     return 1L << RECOMP_MOUSE_X1;
+    case SDL_BUTTON_X2:     return 1L << RECOMP_MOUSE_X2;
+    default:                return 0;
+    }
+}
+
+static long held_buttons(void)
+{
+    Uint32 st = SDL_GetMouseState(NULL, NULL);
+    long held = 0;
+
+    if (st & SDL_BUTTON(SDL_BUTTON_LEFT))   held |= 1L << RECOMP_MOUSE_LEFT;
+    if (st & SDL_BUTTON(SDL_BUTTON_RIGHT))  held |= 1L << RECOMP_MOUSE_RIGHT;
+    if (st & SDL_BUTTON(SDL_BUTTON_MIDDLE)) held |= 1L << RECOMP_MOUSE_MIDDLE;
+    if (st & SDL_BUTTON(SDL_BUTTON_X1))     held |= 1L << RECOMP_MOUSE_X1;
+    if (st & SDL_BUTTON(SDL_BUTTON_X2))     held |= 1L << RECOMP_MOUSE_X2;
+    return held;
+}
+
+static void capture(void)
+{
+    static int said;
+
+    if (!g_win || !recomp_mouse_look_active() || g_captured)
+        return;
+    if (!(SDL_GetWindowFlags(g_win) & SDL_WINDOW_INPUT_FOCUS))
+        return;
+    if (SDL_SetRelativeMouseMode(SDL_TRUE) != 0) {
+        fprintf(stderr, "[INPUT] mouse: relative mode unavailable (%s)\n", SDL_GetError());
+        fflush(stderr);
+        return;
+    }
+    ATOMIC_XCHG(&g_acc_x, 0);
+    ATOMIC_XCHG(&g_acc_y, 0);
+    g_suppress |= held_buttons();       /* the click that captured is not a shot */
+    ATOMIC_XCHG(&g_captured, 1);
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "[INPUT] mouse captured: F8 lets the cursor go, a click "
+                        "on the picture takes it back\n");
+        fflush(stderr);
+    }
+}
+
+static void release(void)
+{
+    if (!g_captured)
+        return;
+    ATOMIC_XCHG(&g_captured, 0);
+    SDL_SetRelativeMouseMode(SDL_FALSE);
+    ATOMIC_XCHG(&g_acc_x, 0);
+    ATOMIC_XCHG(&g_acc_y, 0);
+}
+
+static void drop_buttons(void)
+{
+    ATOMIC_XCHG(&g_buttons, 0);
+    g_suppress = 0;
+}
+
+static int sdl_event(const void *ev)
+{
+    const SDL_Event *e = (const SDL_Event *)ev;
+    const int look = recomp_mouse_look_active();
+    long bit;
+
+    switch (e->type) {
+    case SDL_MOUSEMOTION:
+        if (look && g_captured)
+            recomp_mouse_feed_motion(e->motion.xrel, e->motion.yrel);
+        return 0;
+    case SDL_MOUSEBUTTONUP:
+        bit = button_bit(e->button.button);
+        ATOMIC_AND(&g_buttons, ~bit);
+        g_suppress &= ~bit;
+        return 0;
+    case SDL_MOUSEBUTTONDOWN:
+        bit = button_bit(e->button.button);
+        if (look && !g_captured) {
+            /* A click on the picture takes the mouse back, and is only that. */
+            capture();
+            g_suppress |= bit;
+            return 0;
+        }
+        bit &= ~g_suppress;
+        if (bit)
+            ATOMIC_OR(&g_buttons, bit);
+        return 0;
+    case SDL_MOUSEWHEEL: {
+        int dy = e->wheel.y;
+        if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
+            dy = -dy;
+        if (dy && (!look || g_captured))
+            wheel_notch(dy > 0 ? 0 : 1, dy < 0 ? -dy : dy);
+        return 0;
+    }
+    case SDL_WINDOWEVENT:
+        if (e->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+            release();
+            drop_buttons();
+        } else if (e->window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+            capture();
+        }
+        return 0;
+    case SDL_KEYDOWN:
+        if (e->key.keysym.scancode == SDL_SCANCODE_F8 && !e->key.repeat && look) {
+            if (g_captured)
+                release();
+            else
+                capture();
+            return 1;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static void attach_on_event_thread(void *unused)
+{
+    (void)unused;
+    capture();
+}
 
 void recomp_mouse_attach(void *hwnd)
 {
-    (void)hwnd;
+    if (!hwnd || g_attached || !recomp_mouse_wanted())
+        return;
+    g_win = (SDL_Window *)hwnd;
+    g_attached = 1;
+    host_sdl_set_event_hook(sdl_event);
+    if (recomp_mouse_look_active())
+        fprintf(stderr, "[INPUT] mouse look: %.3f degrees per count (sensitivity %.2f), "
+                        "%s%s; click the picture to capture, F8 to release\n",
+                RECOMP_MOUSE_DEGREES_PER_COUNT * g_cfg.sensitivity, g_cfg.sensitivity,
+                g_cfg.invert_y ? "Y inverted" : "Y not inverted",
+                g_cfg.buttons_bound ? "; mouse buttons are bound" : "");
+    else
+        fprintf(stderr, "[INPUT] mouse buttons are bound; read from the game window\n");
+    fflush(stderr);
+    /* Take the cursor now if the window came up in front. */
+    host_sdl_run_on_event_thread(attach_on_event_thread, NULL);
 }
 
 int recomp_mouse_window_message(void *hwnd, unsigned msg, uintptr_t wp,

@@ -21,6 +21,11 @@ add_compile_definitions(
     WIN32_LEAN_AND_MEAN
     NOMINMAX
 )
+# Linux: the POSIX and GNU extensions the host layers use (pthread_setname_np,
+# memfd_create, MAP_FIXED_NOREPLACE, dladdr, clock_nanosleep).
+if(NOT WIN32)
+    add_compile_definitions(_GNU_SOURCE)
+endif()
 
 # An implicit declaration is an error, everywhere, in every configuration.
 #

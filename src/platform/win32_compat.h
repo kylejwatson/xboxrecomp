@@ -90,6 +90,16 @@ LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
+static inline LONG64 InterlockedIncrement64(volatile LONG64 *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+static inline LONG64 InterlockedDecrement64(volatile LONG64 *p) { return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST); }
+static inline LONG64 InterlockedAdd64(volatile LONG64 *p, LONG64 v) { return __atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); }
+static inline LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
+static inline LONG64 InterlockedExchange64(volatile LONG64 *p, LONG64 v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
+static inline LONG InterlockedAdd(volatile LONG *p, LONG v) { return __atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); }
+static inline LONG InterlockedOr(volatile LONG *p, LONG v) { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
+static inline LONG InterlockedAnd(volatile LONG *p, LONG v) { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
+static inline LONG InterlockedXor(volatile LONG *p, LONG v) { return __atomic_fetch_xor(p, v, __ATOMIC_SEQ_CST); }
+static inline PVOID InterlockedExchangePointer(PVOID volatile *p, PVOID v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
@@ -290,6 +300,14 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
 /* Win32 virtual-key codes (subset the game checks via GetAsyncKeyState) */
 #define VK_LBUTTON   0x01
 #define VK_RBUTTON   0x02
+#define VK_XBUTTON1  0x05
+#define VK_XBUTTON2  0x06
+#define VK_LSHIFT    0xA0
+#define VK_RSHIFT    0xA1
+#define VK_LCONTROL  0xA2
+#define VK_RCONTROL  0xA3
+#define VK_LMENU     0xA4
+#define VK_RMENU     0xA5
 #define VK_CANCEL    0x03
 #define VK_MBUTTON   0x04
 #define VK_BACK      0x08
@@ -321,6 +339,12 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
 #define VK_F3        0x72
 #define VK_F4        0x73
 #define VK_F5        0x74
+#define VK_F6        0x75
+#define VK_F7        0x76
+#define VK_F8        0x77
+#define VK_F9        0x78
+#define VK_F10       0x79
+#define VK_F11       0x7A
 #define VK_F12       0x7B
 #define VK_OEM_PLUS  0xBB
 #define VK_OEM_COMMA 0xBC
@@ -403,6 +427,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_MR_MID_NOT_FOUND        317u
 #define ERROR_IO_PENDING              997u
 #define ERROR_CANCELLED               1223u
+#define ERROR_TIMEOUT                 1460u
 #define ERROR_NO_SYSTEM_RESOURCES     1450u
 #define ERROR_COMMITMENT_LIMIT        1455u
 #define ERROR_DEVICE_NOT_CONNECTED    1167u
@@ -441,10 +466,18 @@ VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
                PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue);
 VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args);
 
-/* Win32 VEH: opaque PEXCEPTION_POINTERS + AddVectoredExceptionHandler stub.
- * On Linux the equivalent goes through sigaction(SIGSEGV/SIGFPE) +
- * ucontext_t; for now we accept the registration and never fire. */
-typedef void *PEXCEPTION_POINTERS;
+/* Win32 VEH, emulated with sigaction (win32_compat.c): SIGSEGV/SIGBUS become
+ * EXCEPTION_ACCESS_VIOLATION with ExceptionInformation[0] = 1 for a write and
+ * [1] = the fault address, a trap-flag SIGTRAP becomes EXCEPTION_SINGLE_STEP
+ * (with TF already cleared, as Windows does), int3 EXCEPTION_BREAKPOINT,
+ * SIGILL and SIGFPE their codes. Handlers run in registration order on the
+ * faulting thread; EXCEPTION_CONTINUE_EXECUTION resumes with the (possibly
+ * changed) CONTEXT, and when every handler declines the signal's default
+ * action runs, so the process still dies with its usual core dump. */
+typedef struct _EXCEPTION_POINTERS {
+    PEXCEPTION_RECORD ExceptionRecord;
+    PCONTEXT          ContextRecord;
+} EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;
 typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
 PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
 ULONG RemoveVectoredExceptionHandler(PVOID Handle);
@@ -453,6 +486,11 @@ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
 #define EXCEPTION_EXECUTE_HANDLER       1
 #define EXCEPTION_CONTINUE_EXECUTION  (-1)
 #define EXCEPTION_ACCESS_VIOLATION       0xC0000005u
+#define EXCEPTION_SINGLE_STEP            0x80000004u
+#define EXCEPTION_BREAKPOINT             0x80000003u
+#define EXCEPTION_PRIV_INSTRUCTION       0xC0000096u
+#define EXCEPTION_INT_OVERFLOW           0xC0000095u
+#define EXCEPTION_IN_PAGE_ERROR          0xC0000006u
 #define EXCEPTION_STACK_OVERFLOW         0xC00000FDu
 #define EXCEPTION_ILLEGAL_INSTRUCTION    0xC000001Du
 #define EXCEPTION_INT_DIVIDE_BY_ZERO     0xC0000094u
@@ -463,6 +501,55 @@ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
 #define EXCEPTION_FLT_UNDERFLOW          0xC0000093u
 #define EXCEPTION_FLT_INEXACT_RESULT     0xC000008Fu
 #define EXCEPTION_FLT_DENORMAL_OPERAND   0xC000008Du
+
+/* ---- WaitOnAddress (futex-backed for 4-byte values) ----------------- */
+BOOL WaitOnAddress(volatile VOID *address, PVOID compare, SIZE_T size, DWORD ms);
+VOID WakeByAddressSingle(PVOID address);
+VOID WakeByAddressAll(PVOID address);
+
+/* ---- dbghelp subset ---------------------------------------------------
+ * Enough for the fault handlers to name the function a host address is in.
+ * SymFromAddr is dladdr: it names exported symbols, so a title links with
+ * -rdynamic (ENABLE_EXPORTS) to have every generated sub_XXXXXXXX named. */
+typedef uint64_t DWORD64, *PDWORD64;
+typedef struct _SYMBOL_INFO {
+    ULONG   SizeOfStruct;
+    ULONG   TypeIndex;
+    ULONG64 Reserved[2];
+    ULONG   Index;
+    ULONG   Size;
+    ULONG64 ModBase;
+    ULONG   Flags;
+    ULONG64 Value;
+    ULONG64 Address;
+    ULONG   Register;
+    ULONG   Scope;
+    ULONG   Tag;
+    ULONG   NameLen;
+    ULONG   MaxNameLen;
+    CHAR    Name[1];
+} SYMBOL_INFO, *PSYMBOL_INFO;
+#define SYMOPT_UNDNAME        0x00000002u
+#define SYMOPT_DEFERRED_LOADS 0x00000004u
+DWORD SymSetOptions(DWORD options);
+BOOL  SymInitialize(HANDLE process, PCSTR search_path, BOOL invade);
+BOOL  SymFromAddr(HANDLE process, DWORD64 address, PDWORD64 displacement,
+                  PSYMBOL_INFO symbol);
+
+/* The executable's own path (/proc/self/exe); hModule must be NULL. */
+DWORD GetModuleFileNameA(HMODULE module, LPSTR name, DWORD size);
+
+/* ---- Host window and keyboard ----------------------------------------
+ * Backed by whichever library owns the game window (src/platform/host_sdl.c
+ * on Linux), so code written against these Win32 calls -- the input
+ * bindings, the F6..F11 hot keys, the watchpoints' focus check -- works
+ * unchanged. Before a window exists every key reads up and nothing is in
+ * front. */
+HWND  GetForegroundWindow(void);
+DWORD GetWindowThreadProcessId(HWND hwnd, LPDWORD process_id);
+/* The window's drawable size in pixels (what a swap chain covers). */
+BOOL  GetClientRect(HWND hwnd, LPRECT rc);
+BOOL  IsIconic(HWND hwnd);
 
 /* ---- Memory query ----------------------------------------------------- */
 typedef struct _MEMORY_BASIC_INFORMATION {

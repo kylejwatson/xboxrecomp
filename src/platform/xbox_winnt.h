@@ -124,6 +124,14 @@ typedef int                BOOL,  *PBOOL;
 typedef int64_t            LONGLONG,  LONG64,  *PLONGLONG;
 typedef uint64_t           ULONGLONG, ULONG64, *PULONGLONG, DWORDLONG;
 typedef float              FLOAT;
+typedef uint8_t            UINT8, *PUINT8;
+typedef int8_t             INT8,  *PINT8;
+typedef uint16_t           UINT16;
+typedef int16_t            INT16;
+typedef uint32_t           UINT32;
+typedef int32_t            INT32;
+typedef uint64_t           UINT64;
+typedef int64_t            INT64;
 typedef double             DOUBLE;
 
 /* void aliases */
@@ -137,9 +145,19 @@ typedef void             **PHANDLE, **LPHANDLE;
 typedef void              *HMODULE, *HINSTANCE, *HKEY, *HLOCAL, *HGLOBAL;
 typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
 
-/* PCONTEXT: Windows VEH register state. On Linux the equivalent is
- * ucontext_t*; we leave it opaque here since Linux callers don't use it. */
-typedef void              *PCONTEXT;
+/* CONTEXT: the x86-64 register state a vectored exception handler sees and
+ * may change. The field names are Windows' (the MMIO decoders, watchpoints
+ * and fault handlers address registers as ctx->Rax, ctx->Rip, ctx->EFlags);
+ * the layout is not, and nothing depends on it. win32_compat.c fills one from
+ * the signal's ucontext_t and writes it back when a handler resumes. */
+typedef struct _CONTEXT {
+    uint32_t ContextFlags;
+    uint32_t EFlags;
+    uint64_t Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    uint64_t R8, R9, R10, R11, R12, R13, R14, R15;
+    uint64_t Rip;
+    uint32_t MxCsr;
+} CONTEXT, *PCONTEXT;
 
 /* Xbox/UTF-16 wide char is 16-bit, unlike the 32-bit Linux wchar_t. */
 typedef uint16_t           WCHAR, *PWCHAR, *LPWSTR, *PWSTR;

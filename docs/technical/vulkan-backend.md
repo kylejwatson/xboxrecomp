@@ -1,6 +1,16 @@
 # A Vulkan backend for `src/d3d`
 
-**Status: analysis, September 2026. No code written.** CLAUDE.md records the
+**Status, October 2026: implemented for Linux, differently from the plan below.**
+The seam went at the D3D11 API itself: `src/d3d/vk/d3d11_vk.c` implements the
+D3D11 subset `src/d3d` calls (61 entry points) on Vulkan 1.3, so the renderer and
+the Windows backend are unchanged and nothing above was split into an RHI.
+Shaders go through shaderc (glslang's HLSL front end) instead of DXC. Section 4.4's
+front-face inversion is **wrong**: a negative-height viewport reproduces D3D's
+framebuffer positions, so the winding seen on screen is already D3D's and
+`FrontCounterClockwise` maps directly (as DXVK does). The rest of this document
+is the original analysis, kept for its measurements.
+
+**Original status: analysis, September 2026. No code written.** CLAUDE.md records the
 decision ("Backend decision (Sep 2026): Vulkan, for portability — Linux, Steam
 Deck, Android") and two of its costs (the Y-flip, the winding inversion). This
 document is the work behind that one paragraph: where the seam goes, what

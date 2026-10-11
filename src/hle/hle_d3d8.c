@@ -68,7 +68,7 @@
 #include "hle.h"
 #include "recomp_config.h"
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 #include "d3d8_xbox.h"
 #include "d3d8_vsh.h"
 #include "d3d8_overlay.h"
@@ -76,6 +76,9 @@
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
 #include "recomp_mouse.h"
+#endif
+#if !defined(_WIN32)
+#include "platform/host_sdl.h"
 #endif
 
 static void first_call(int *seen, const char *name, uint32_t arg)
@@ -105,9 +108,11 @@ HLE_EXPORT(D3DDevice_SetSoftDisplayFilter)
 
 /* ------------------------------------------------------------------ shadow */
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 
+#ifdef _WIN32
 #define SHADOW_WM_DESTROY (WM_APP + 1)
+#endif
 
 static int                g_shadow_mode = -1;
 static int                g_shadow_tried;
@@ -250,6 +255,7 @@ static int shadow_requested(void)
 /* kernel_bridge.c: the flushes a title's own exit does, then ExitProcess. */
 extern void xbox_HostExit(const char *why);
 
+#ifdef _WIN32
 static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     intptr_t answered = 0;
@@ -364,6 +370,34 @@ static HWND shadow_window(UINT width, UINT height)
     return req.hwnd;
 }
 
+#else  /* !_WIN32: the SDL window (src/platform/host_sdl.c) */
+
+static void shadow_window_closed(void)
+{
+    /* As WM_CLOSE above: the window is the game's display, so closing it is
+     * the user quitting. */
+    fprintf(stderr, "[HLE-D3D8] window closed by the user\n");
+    fflush(stderr);
+    xbox_HostExit("window closed");
+}
+
+static HWND shadow_window(UINT width, UINT height)
+{
+    const char *name = xbox_XbeTitleName();
+    HWND hwnd;
+
+    host_sdl_set_close_hook(shadow_window_closed);
+    hwnd = host_sdl_window_create(width, height,
+                                  name && *name ? name : "xboxrecomp");
+    if (!hwnd)
+        fprintf(stderr, "[HLE-D3D8] shadow: could not open a window\n");
+    else
+        recomp_mouse_attach(hwnd);
+    return hwnd;
+}
+
+#endif /* _WIN32 */
+
 /* The surfaces the XDK sets as target and depth inside CreateDevice -- the
  * frame buffer and the automatic depth buffer, 0 until seen -- and the host
  * device's own depth surface (shadow_set_render_target). */
@@ -463,7 +497,7 @@ int hle_d3d8_is_framebuffer(uint32_t phys)
  * lose. A frame buffer bound as a texture while the host holds the other one
  * is filled from that copy (hle_d3d8_texture.c). Two full-screen copies a
  * frame for a title that uses both buffers, none for one that does not. */
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 static uint32_t g_target_fb;            /* frame buffer being drawn into, 0 offscreen */
 static uint32_t g_host_holds;           /* frame buffer the host back buffer holds */
 static struct { uint32_t phys; IDirect3DTexture8 *tex; int valid; } g_fb_kept[4];
@@ -634,7 +668,9 @@ static void shadow_create(uint32_t pp_va)
     if (FAILED(hr) || !g_shadow) {
         fprintf(stderr, "[HLE-D3D8] shadow: CreateDevice failed (0x%08lX)\n", (unsigned long)hr);
         g_shadow = NULL;
+#ifdef _WIN32
         PostMessageA(hwnd, SHADOW_WM_DESTROY, 0, 0);
+#endif
         return;
     }
     /* Never wait for vertical blank here. The title paces its loader on the
@@ -1304,7 +1340,7 @@ static void shadow_dump_frame(void)
     surf->lpVtbl->Release(surf);
 }
 
-#endif /* _WIN32 */
+#endif /* HLE_HOST_RENDERER */
 
 HLE_ORIGINAL(Direct3D_CreateDevice);
 HLE_ORIGINAL(D3DDevice_Clear);
@@ -1610,7 +1646,7 @@ HLE_EXPORT(Direct3D_CreateDevice)
     first_call(&seen, "Direct3D_CreateDevice", pp_va);
     if (original_missing(hle_original_Direct3D_CreateDevice, "Direct3D_CreateDevice"))
         HLE_RETURN(0x80004005u);                 /* E_FAIL */
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     g_in_create_device = 1;
 #endif
     /* Before the original, not after: some XDKs wait on the fence inside
@@ -1622,7 +1658,7 @@ HLE_EXPORT(Direct3D_CreateDevice)
     mirror_gpu_time_fence();
     HLE_CALL_ORIGINAL(Direct3D_CreateDevice);
     mirror_swap_throttle();
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     g_in_create_device = 0;
     if (pp_va) {
         /* D3DPRESENT_PARAMETERS: BackBufferCount +0xC, SwapEffect +0x14,
@@ -1655,7 +1691,7 @@ HLE_EXPORT(Direct3D_CreateDevice)
 HLE_EXPORT(D3DDevice_Clear)
 {
     static int seen;
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t flags = HLE_ARG(2), color = HLE_ARG(3);
     uint32_t z_bits = HLE_ARG(4), stencil = HLE_ARG(5);
     /* Read before the XDK's body runs, like every argument here: it reuses
@@ -1668,7 +1704,7 @@ HLE_EXPORT(D3DDevice_Clear)
     if (original_missing(hle_original_D3DDevice_Clear, "D3DDevice_Clear"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_Clear);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow) {
         float z;
 
@@ -1821,7 +1857,7 @@ static void overlay_frame(void)
 }
 
 /* HRESULT D3DDevice_Swap(DWORD Flags)                                       */
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 /* Everything a completed frame needs after the title's own flip has run:
  * the capture boundary, the frame dump, the overlay, the host present and
  * the five-second report. Shared because a title reaches this point
@@ -1956,7 +1992,7 @@ HLE_EXPORT(D3DDevice_Swap)
     /* Counted before anything else here runs, so RECOMP_FPS means the same
      * thing whatever is switched on below. */
     xbox_FpsCountSwap();
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_backbuffer_va)
         note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
     if (shadow_trace_on())
@@ -1985,7 +2021,7 @@ HLE_EXPORT(D3DDevice_Swap)
         g_swap_last = t2;
         g_swap_timed++;
     }
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     frame_end_shadow(flags);
 #endif
 }
@@ -2018,7 +2054,7 @@ HLE_EXPORT(D3DDevice_Present)
     }
 
     xbox_FpsCountSwap();
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_backbuffer_va)
         note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
 #endif
@@ -2036,12 +2072,12 @@ HLE_EXPORT(D3DDevice_Present)
         g_swap_last = t2;
         g_swap_timed++;
     }
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     frame_end_shadow(0);
 #endif
 }
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 /* The XDK keeps the declaration it parsed in the shader object itself:
  * X_D3DVertexShader { RefCount, Flags, ProgramSize, ProgramAndConstantsDwords,
  * BYTE Dimensionality[4], X_VERTEXATTRIBUTEFORMAT VertexAttribute } -- 16 slots
@@ -2327,7 +2363,7 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
     static int seen;
     uint32_t declaration = HLE_ARG(0);
     uint32_t function = HLE_ARG(1);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t handle_va = HLE_ARG(2);
 #endif
 
@@ -2337,7 +2373,7 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
                          "D3DDevice_CreateVertexShader"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_CreateVertexShader);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow && (int32_t)g_eax >= 0 && handle_va) {
         uint32_t guest = HLE_MEM32(handle_va);
         uint32_t header = function ? HLE_MEM32(function) : 0;
@@ -2393,7 +2429,7 @@ HLE_EXPORT(D3DDevice_LoadVertexShaderProgram)
 {
     static int seen;
     uint32_t function = HLE_ARG(0);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t address = HLE_ARG(1);
 #endif
 
@@ -2402,7 +2438,7 @@ HLE_EXPORT(D3DDevice_LoadVertexShaderProgram)
                          "D3DDevice_LoadVertexShaderProgram"))
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_LoadVertexShaderProgram);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow && function && address < SHADOW_PROGRAM_SLOTS) {
         static int logged;
         uint32_t header = HLE_MEM32(function);
@@ -2460,7 +2496,7 @@ HLE_EXPORT(D3DDevice_SetVertexShader)
     if (original_missing(hle_original_D3DDevice_SetVertexShader, "D3DDevice_SetVertexShader"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShader);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow)
         shadow_select_vertex_shader(handle, SHADOW_PROGRAM_SLOTS);
 #endif
@@ -2480,7 +2516,7 @@ HLE_EXPORT(D3DDevice_SelectVertexShader)
                          "D3DDevice_SelectVertexShader"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SelectVertexShader);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow && handle)
         shadow_select_vertex_shader(handle, HLE_ARG(1));
 #endif
@@ -2495,7 +2531,7 @@ HLE_EXPORT(D3DDevice_SelectVertexShader)
 HLE_EXPORT(D3DDevice_SetPixelShader)
 {
     static int seen;
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     static int dumped;
     uint32_t handle = HLE_ARG(0);
 #endif
@@ -2505,7 +2541,7 @@ HLE_EXPORT(D3DDevice_SetPixelShader)
                          "D3DDevice_SetPixelShader"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SetPixelShader);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow)
         hle_d3d8_pixel_shader_selected(handle);
     if (handle >= 0x10000u && handle < 0x08000000u && !(handle & 3u) &&
@@ -2525,7 +2561,7 @@ HLE_EXPORT(D3DDevice_SetPixelShader)
 #endif
 }
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 /* Immediate mode, drawn (D3DDevice_Begin ... SetVertexData* ... End).
  *
  * Each SetVertexData* between Begin and End sets one input register's current
@@ -2695,7 +2731,7 @@ static void inline_draw(void)
 HLE_EXPORT(D3DDevice_SetVertexDataColor)
 {
     static int seen;
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t reg = HLE_ARG(0), color = HLE_ARG(1);
 #endif
 
@@ -2704,7 +2740,7 @@ HLE_EXPORT(D3DDevice_SetVertexDataColor)
                          "D3DDevice_SetVertexDataColor"))
         return;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexDataColor);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow) {
         float v[4];
 
@@ -2723,7 +2759,7 @@ HLE_EXPORT(D3DDevice_SetVertexDataColor)
 HLE_EXPORT(D3DDevice_SetVertexData2f)
 {
     static int seen;
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t reg = HLE_ARG(0), a = HLE_ARG(1), b = HLE_ARG(2);
 #endif
 
@@ -2732,7 +2768,7 @@ HLE_EXPORT(D3DDevice_SetVertexData2f)
                          "D3DDevice_SetVertexData2f"))
         return;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexData2f);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow) {
         float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
@@ -2776,7 +2812,7 @@ HLE_EXPORT(D3DDevice_Begin)
     g_inline_begin++;
     g_inline_begin_frame++;
     HLE_CALL_ORIGINAL(D3DDevice_Begin);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     g_inline_on = 1;
     g_inline_xpt = HLE_ARG(0);
     g_inline_nverts = 0;
@@ -2793,7 +2829,7 @@ HLE_EXPORT(D3DDevice_End)
         return;
     g_inline_end++;
     HLE_CALL_ORIGINAL(D3DDevice_End);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_inline_on) {
         inline_draw();
         g_inline_on = 0;
@@ -2815,7 +2851,7 @@ HLE_EXPORT(D3DDevice_SetVertexData4f)
     g_inline_vdata++;
     g_inline_vdata_frame++;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexData4f);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow) {
         uint32_t w[4] = { HLE_ARG(1), HLE_ARG(2), HLE_ARG(3), HLE_ARG(4) };
         float v[4];
@@ -2836,7 +2872,7 @@ HLE_EXPORT(D3DDevice_SetTransform)
 {
     static int seen;
     uint32_t state = HLE_ARG(0);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t matrix = HLE_ARG(1);
 #endif
 
@@ -2844,7 +2880,7 @@ HLE_EXPORT(D3DDevice_SetTransform)
     if (original_missing(hle_original_D3DDevice_SetTransform, "D3DDevice_SetTransform"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SetTransform);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow && matrix && state < 10) {
         D3DMATRIX m;
         DWORD host_state;
@@ -2877,7 +2913,7 @@ HLE_EXPORT(D3DDevice_SetMaterial)
     if (original_missing(hle_original_D3DDevice_SetMaterial, "D3DDevice_SetMaterial"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SetMaterial);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow && material) {
         D3DMATERIAL8 m;
         memcpy(&m, HLE_PTR(material), sizeof m);
@@ -2891,7 +2927,7 @@ HLE_EXPORT(D3DDevice_SetLight)
 {
     static int seen;
     uint32_t index = HLE_ARG(0);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t light = HLE_ARG(1);
 #endif
 
@@ -2899,7 +2935,7 @@ HLE_EXPORT(D3DDevice_SetLight)
     if (original_missing(hle_original_D3DDevice_SetLight, "D3DDevice_SetLight"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SetLight);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow && light) {
         D3DLIGHT8 l;
         memcpy(&l, HLE_PTR(light), sizeof l);
@@ -2913,7 +2949,7 @@ HLE_EXPORT(D3DDevice_LightEnable)
 {
     static int seen;
     uint32_t index = HLE_ARG(0);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t enable = HLE_ARG(1);
 #endif
 
@@ -2921,7 +2957,7 @@ HLE_EXPORT(D3DDevice_LightEnable)
     if (original_missing(hle_original_D3DDevice_LightEnable, "D3DDevice_LightEnable"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_LightEnable);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow)
         host_LightEnable(g_shadow, index, enable ? TRUE : FALSE);
 #endif
@@ -2938,7 +2974,7 @@ HLE_EXPORT(D3DDevice_SetViewport)
     if (original_missing(hle_original_D3DDevice_SetViewport, "D3DDevice_SetViewport"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SetViewport);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow && viewport) {
         D3DVIEWPORT8 vp;
 
@@ -2979,7 +3015,7 @@ HLE_EXPORT(D3DDevice_SetScissors)
     if (original_missing(hle_original_D3DDevice_SetScissors, "D3DDevice_SetScissors"))
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_SetScissors);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow) {
         D3DRECT rect[8];
         UINT n = count > 8 ? 8 : count;
@@ -2993,7 +3029,7 @@ HLE_EXPORT(D3DDevice_SetScissors)
 #endif
 }
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 /* ------------------------------------------------------------ render targets
  *
  * Titles draw into textures -- Burnout 2 renders its world several times a
@@ -3286,7 +3322,7 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     g_host_viewport_mode = -1;
     shadow_viewport_constants(&g_title_viewport);
 }
-#endif /* _WIN32 */
+#endif /* HLE_HOST_RENDERER */
 
 /* void D3DDevice_InsertCallback(D3DCALLBACKTYPE Type, D3DCALLBACK pCallback,
  *     DWORD Context) -- stdcall; the callback is __cdecl void (DWORD Context).
@@ -3355,7 +3391,7 @@ HLE_EXPORT(D3DDevice_EnableOverlay)
     uint32_t enable = HLE_ARG(0);
 
     first_call(&seen, "D3DDevice_EnableOverlay", enable);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     g_overlay_enabled = enable != 0;
     if (!enable) {
         g_overlay_updated = 0;
@@ -3374,7 +3410,7 @@ HLE_EXPORT(D3DDevice_UpdateOverlay)
     if (original_missing(hle_original_D3DDevice_UpdateOverlay, "D3DDevice_UpdateOverlay"))
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_UpdateOverlay);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     /* A title that never calls EnableOverlay still means the plane to show
      * when it updates it; the XDK turns it on at the first update. */
     g_overlay_enabled = 1;
@@ -3394,7 +3430,7 @@ HLE_ORIGINAL(D3DDevice_SetRenderTargetFast);
 HLE_EXPORT(D3DDevice_SetRenderTargetFast)
 {
     static int seen;
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t rt = HLE_ARG(0), zs = HLE_ARG(1);
 #endif
 
@@ -3403,7 +3439,7 @@ HLE_EXPORT(D3DDevice_SetRenderTargetFast)
                          "D3DDevice_SetRenderTargetFast"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SetRenderTargetFast);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow)
         shadow_set_render_target(rt, zs);
 #endif
@@ -3414,7 +3450,7 @@ HLE_EXPORT(D3DDevice_SetRenderTargetFast)
 HLE_EXPORT(D3DDevice_SetRenderTarget)
 {
     static int seen;
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t rt = HLE_ARG(0), zs = HLE_ARG(1);
 #endif
 
@@ -3422,7 +3458,7 @@ HLE_EXPORT(D3DDevice_SetRenderTarget)
     if (original_missing(hle_original_D3DDevice_SetRenderTarget, "D3DDevice_SetRenderTarget"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SetRenderTarget);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_in_create_device && rt) {
         g_backbuffer_va = rt;
         g_autodepth_va = zs;
@@ -3448,7 +3484,7 @@ HLE_EXPORT(D3DDevice_GetBackBuffer2)
     if (original_missing(hle_original_D3DDevice_GetBackBuffer2, "D3DDevice_GetBackBuffer2"))
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_GetBackBuffer2);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow && g_eax && (int32_t)HLE_ARG(0) <= 0) {
         g_backbuffer_va = g_eax;
         note_swap_surface(g_eax);
@@ -3478,7 +3514,7 @@ HLE_EXPORT(D3DDevice_GetBackBuffer2)
 HLE_EXPORT(D3DDevice_CopyRects)
 {
     static int seen;
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     /* All read before the XDK's body runs: it reuses its argument slots, and
      * read afterwards the rectangle count was always 0. */
     uint32_t src = HLE_ARG(0), dst = HLE_ARG(3);
@@ -3489,7 +3525,7 @@ HLE_EXPORT(D3DDevice_CopyRects)
     if (original_missing(hle_original_D3DDevice_CopyRects, "D3DDevice_CopyRects"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_CopyRects);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (g_shadow && src && dst && shadow_trace_on())
         fprintf(stderr, "[TRACE swap %lu] CopyRects src 0x%08X data 0x%08X -> dst 0x%08X data 0x%08X"
                 " (%u rects at 0x%08X, points 0x%08X)\n",
@@ -3566,7 +3602,7 @@ HLE_EXPORT(D3DDevice_CopyRects)
 }
 
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 /* The vertices a program with NORMPACKED3 registers reads: each vertex copied
  * behind its unpacked normals, as shadow_read_declaration laid them out. The
  * bits are x:11, y:11, z:10, signed, divided by 1023, 1023 and 511
@@ -3815,7 +3851,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
     if (SUCCEEDED(hr))
         note_draw_sampled_movie();
 }
-#endif /* _WIN32 */
+#endif /* HLE_HOST_RENDERER */
 
 /* void D3DDevice_DrawVerticesUP(D3DPRIMITIVETYPE PrimitiveType,
  *     UINT VertexCount, const void *pVertexStreamZeroData,
@@ -3824,7 +3860,7 @@ HLE_EXPORT(D3DDevice_DrawVerticesUP)
 {
     static int seen;
     uint32_t xpt = HLE_ARG(0);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t count = HLE_ARG(1), data = HLE_ARG(2), stride = HLE_ARG(3);
 #endif
 
@@ -3832,7 +3868,7 @@ HLE_EXPORT(D3DDevice_DrawVerticesUP)
     if (original_missing(hle_original_D3DDevice_DrawVerticesUP, "D3DDevice_DrawVerticesUP"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawVerticesUP);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (data)
         hle_d3d8_shadow_draw(xpt, count, HLE_PTR(data), stride, 0);
 #endif
@@ -3846,7 +3882,7 @@ HLE_EXPORT(D3DDevice_DrawIndexedVerticesUP)
 {
     static int seen;
     uint32_t xpt = HLE_ARG(0);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t count = HLE_ARG(1), index_va = HLE_ARG(2);
     uint32_t data = HLE_ARG(3), stride = HLE_ARG(4);
 #endif
@@ -3856,14 +3892,14 @@ HLE_EXPORT(D3DDevice_DrawIndexedVerticesUP)
                          "D3DDevice_DrawIndexedVerticesUP"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawIndexedVerticesUP);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     if (index_va && data)
         hle_d3d8_shadow_draw_indexed(xpt, count, (const uint16_t *)HLE_PTR(index_va),
                                      HLE_PTR(data), stride, 0);
 #endif
 }
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 /* For hle_d3d8_texture.c: the shadow device (NULL when shadow mode is off)
  * and the frame count its cache ages entries by. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void)

@@ -42,7 +42,7 @@
 #include <string.h>
 #include "hle.h"
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
 #include "hle_d3d8_record.h"
@@ -1038,11 +1038,11 @@ static void report(void)
         last = now;
     }
 }
-#endif /* _WIN32 */
+#endif /* HLE_HOST_RENDERER */
 
 HLE_ORIGINAL(D3DDevice_SetTexture);
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 static void shadow_set_texture(uint32_t stage, uint32_t texture);
 static void op_set_texture(const void *arg)
 {
@@ -1056,7 +1056,7 @@ HLE_EXPORT(D3DDevice_SetTexture)
 {
     static int seen;
     uint32_t stage = HLE_ARG(0);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t texture = HLE_ARG(1);
 #endif
 
@@ -1069,7 +1069,7 @@ HLE_EXPORT(D3DDevice_SetTexture)
         HLE_RETURN(0x80004005u);
     }
     HLE_CALL_ORIGINAL(D3DDevice_SetTexture);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     /* Deferred (RECOMP_HLE_D3D8_DEFER), the host side runs when the frame is
      * executed, so the texels are read then -- as the NV2A reads them when it
      * reaches the draw, not when the title issued it. */
@@ -1084,7 +1084,7 @@ HLE_EXPORT(D3DDevice_SetTexture)
 #endif
 }
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 static void shadow_set_texture(uint32_t stage, uint32_t texture)
 {
     {
@@ -1196,7 +1196,7 @@ HLE_ORIGINAL(D3DDevice_SetPalette);
 HLE_EXPORT(D3DDevice_SetPalette)
 {
     static int seen;
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     uint32_t stage = HLE_ARG(0), palette_va = HLE_ARG(1);
 #endif
 
@@ -1212,7 +1212,7 @@ HLE_EXPORT(D3DDevice_SetPalette)
         return;
     }
     HLE_CALL_ORIGINAL(D3DDevice_SetPalette);
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
     {
         IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
         uint32_t data;

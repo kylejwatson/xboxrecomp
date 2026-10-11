@@ -37,8 +37,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "hle.h"
 
-#ifdef _WIN32
+#if HLE_HOST_RENDERER
 
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
@@ -1471,4 +1472,4 @@ void host_combiners_set_pixel_shader(DWORD token)
     d3d8_combiners_set_pixel_shader(token);
 }
 
-#endif /* _WIN32 */
+#endif /* HLE_HOST_RENDERER */

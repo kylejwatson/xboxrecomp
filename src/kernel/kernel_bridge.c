@@ -30,6 +30,8 @@
 #include "recomp_icall_feedback.h"
 #ifdef _WIN32
 #include <mmsystem.h>      /* timeBeginPeriod, for the vblank clock's fallback */
+#else
+#include <time.h>          /* nanosleep, the vblank clock's wait */
 #endif
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
@@ -1603,9 +1605,7 @@ static void event_wake_waiters(uint32_t va)
     volatile LONG *gen = event_generation(va);
     if (gen) {
         InterlockedIncrement(gen);
-#ifdef _WIN32
         WakeByAddressAll((PVOID)gen);
-#endif
     }
 }
 
@@ -1632,14 +1632,10 @@ static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
         if (poll_only || (deadline && GetTickCount64() >= deadline))
             return 0x00000102u;                 /* STATUS_TIMEOUT */
         if (gen) {
-#ifdef _WIN32
             /* Sleep on the counter; a set wakes this at once. The 1 ms cap
              * keeps timeouts and a missed wake from costing more than that. */
             LONG seen = gen0;
             WaitOnAddress((volatile VOID *)gen, &seen, sizeof seen, 1);
-#else
-            Sleep(1);
-#endif
         } else if (++spins < 64) {
             SwitchToThread();
         } else {
@@ -3022,11 +3018,16 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
      * fires within about 0.5 ms. Where it is unavailable, timeBeginPeriod(1)
      * gets Sleep close to 1 ms at the cost of a system-wide 1 kHz tick. */
     {
+#ifdef _WIN32
         HANDLE hires = CreateWaitableTimerExW(NULL, NULL,
                                               0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
                                               TIMER_ALL_ACCESS);
         if (!hires && vblank_clock_wait_us() >= 0)
             timeBeginPeriod(1);
+#else
+        /* nanosleep on Linux already wakes within tens of microseconds. */
+        HANDLE hires = NULL;
+#endif
 
         for (;;) {
             long long now;
@@ -3040,6 +3041,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                  * granularity: never sleep longer than that. */
                 if (wait_us > 10000)
                     wait_us = 10000;
+#ifdef _WIN32
                 if (hires) {
                     LARGE_INTEGER due;
                     due.QuadPart = -(wait_us * 10);
@@ -3048,6 +3050,16 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 } else {
                     Sleep((DWORD)((wait_us + 999) / 1000));
                 }
+#else
+                (void)hires;
+                {
+                    struct timespec ts;
+                    ts.tv_sec = (time_t)(wait_us / 1000000);
+                    ts.tv_nsec = (long)(wait_us % 1000000) * 1000L;
+                    while (nanosleep(&ts, &ts) != 0)
+                        ;
+                }
+#endif
             }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_apu_tick();     /* the APU's interrupt line */

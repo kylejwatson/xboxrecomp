@@ -110,7 +110,6 @@ void apu_mixer_stop(int slot);
  */
 extern MCPXAPUState *g_apu_state;
 
-#ifdef _WIN32
 struct _CONTEXT;
 int apu_hook_handle_mmio(struct _CONTEXT *ctx, uintptr_t fault_addr,
                          uint32_t fault_xbox_va, int is_write);
@@ -141,7 +140,6 @@ int mcpx_ac97_handle_write(struct _CONTEXT *ctx, uintptr_t host_addr,
 
 int nv2a_intr_handle_write(struct _CONTEXT *ctx, uintptr_t host_addr,
                            uint32_t nv2a_offset, uintptr_t aperture);
-#endif
 
 #ifdef __cplusplus
 }

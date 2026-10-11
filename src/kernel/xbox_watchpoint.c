@@ -58,8 +58,8 @@
 #include "xbox_watchpoint.h"
 
 #ifdef _WIN32
-
 #include <dbghelp.h>
+#endif
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
@@ -499,7 +499,6 @@ int xbox_watch_handle_step(PEXCEPTION_POINTERS ep)
     return 1;
 }
 
-#endif /* _WIN32 */
 
 void xbox_watch_scan_value(uint32_t value)
 {

@@ -18,7 +18,6 @@
 
 #include "d3d8_internal.h"
 
-#if defined(_WIN32)
 
 /* Read once, from the environment, before the first device is created.
  *
@@ -74,6 +73,5 @@ HRESULT d3d8_display_resolve(ID3D11ShaderResourceView *scene,
 
 void d3d8_display_shutdown(void);
 
-#endif /* _WIN32 */
 
 #endif /* XBOXRECOMP_D3D8_DISPLAY_H */
