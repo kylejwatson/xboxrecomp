@@ -2,10 +2,13 @@
  * recomp_mouse.c -- see recomp_mouse.h.
  *
  * Two threads meet here. The game window's thread receives WM_INPUT and adds
- * each movement to a pair of interlocked accumulators, and sets or clears a
+ * each movement to a pair of interlocked running totals, and sets or clears a
  * bit per button; it never waits for anything, because a window thread that
  * blocks stalls the Present that is waiting on it. The title's look hook, on
- * a guest thread, swaps the accumulators out once a game frame.
+ * a guest thread, takes what the totals gained once a game frame -- up to
+ * the last frame mark (recomp_mouse_frame_mark, at each Swap), not up to the
+ * moment it runs, so a frame's turn covers the same span of time as the rest
+ * of the frame even when the host was late to present the one before.
  *
  * An earlier version (e00a4eb, never merged here) turned the movement into a
  * right-stick deflection. That cannot give 1:1 aim: the title's stick code
@@ -72,7 +75,9 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static RecompMouseConfig g_cfg = { 1, 2.5, 0, 0 };
 static int g_title_look;
 
-static mouse_atomic g_acc_x, g_acc_y;   /* counts not yet taken by the title */
+/* Every count fed since start-up. They only ever grow (or wrap), so a span
+ * of time is the difference of two readings: see mouse_delta. */
+static mouse_atomic g_tot_x, g_tot_y;
 static mouse_atomic g_buttons;          /* bit per RECOMP_MOUSE_LEFT..X2 */
 static mouse_atomic g_wheel_pending[2]; /* notches not yet pressed: up, down */
 static mouse_atomic g_captured;
@@ -81,6 +86,34 @@ static mouse_atomic g_recording, g_rec_x, g_rec_y;
 /* Under g_lock. */
 static double g_last_take;
 static struct { int pressed; double until; } g_wheel[2];
+/* The totals when the title last took motion, and at the last frame mark.
+ * g_mark_seq counts marks; g_taken_seq is the mark the last take used, so
+ * a take with no mark since the one before takes up to now. */
+static long g_taken_x, g_taken_y, g_mark_x, g_mark_y;
+static unsigned long g_mark_seq, g_taken_seq;
+
+/* b - a for two readings of a running total, through a wrap: the totals are
+ * 32 bits on Windows. */
+static long mouse_delta(long b, long a)
+{
+    return (long)(int32_t)((uint32_t)b - (uint32_t)a);
+}
+
+/* Counts fed so far are not the title's: the cursor was just captured or
+ * let go, or the hook stopped running long enough for them to be stale. */
+static void drop_pending_locked(void)
+{
+    g_taken_x = g_mark_x = g_tot_x;
+    g_taken_y = g_mark_y = g_tot_y;
+    g_taken_seq = g_mark_seq;
+}
+
+static void drop_pending(void)
+{
+    LOCK();
+    drop_pending_locked();
+    UNLOCK();
+}
 
 static double now_seconds(void)
 {
@@ -138,9 +171,9 @@ int recomp_mouse_captured(void)
 void recomp_mouse_feed_motion(long dx, long dy)
 {
     if (dx)
-        ATOMIC_ADD(&g_acc_x, dx);
+        ATOMIC_ADD(&g_tot_x, dx);
     if (dy)
-        ATOMIC_ADD(&g_acc_y, dy);
+        ATOMIC_ADD(&g_tot_y, dy);
     if (g_recording) {
         if (dx)
             ATOMIC_ADD(&g_rec_x, dx);
@@ -163,21 +196,40 @@ int recomp_mouse_take_recorded(long *dx, long *dy)
     return x != 0 || y != 0;
 }
 
+void recomp_mouse_frame_mark(void)
+{
+    LOCK();
+    g_mark_x = g_tot_x;
+    g_mark_y = g_tot_y;
+    g_mark_seq++;
+    UNLOCK();
+}
+
 int recomp_mouse_take_motion(long *dx, long *dy)
 {
     double now;
-    long x, y;
-    int stale;
+    long x = 0, y = 0, to_x, to_y;
 
     LOCK();
     now = now_seconds();
-    stale = g_last_take <= 0.0 || now - g_last_take > MOUSE_STALE_SECONDS;
+    if (g_last_take <= 0.0 || now - g_last_take > MOUSE_STALE_SECONDS) {
+        drop_pending_locked();
+    } else {
+        if (g_taken_seq != g_mark_seq) {
+            to_x = g_mark_x;            /* up to the frame mark */
+            to_y = g_mark_y;
+        } else {
+            to_x = g_tot_x;             /* no mark since the last take */
+            to_y = g_tot_y;
+        }
+        x = mouse_delta(to_x, g_taken_x);
+        y = mouse_delta(to_y, g_taken_y);
+        g_taken_x = to_x;
+        g_taken_y = to_y;
+        g_taken_seq = g_mark_seq;
+    }
     g_last_take = now;
     UNLOCK();
-    x = ATOMIC_XCHG(&g_acc_x, 0);
-    y = ATOMIC_XCHG(&g_acc_y, 0);
-    if (stale)
-        x = y = 0;
     if (g_cfg.invert_y)
         y = -y;
     if (dx) *dx = x;
@@ -335,8 +387,7 @@ static void capture(HWND hwnd)
         return;
     clip_to_client(hwnd);
     SetCursor(NULL);
-    ATOMIC_XCHG(&g_acc_x, 0);
-    ATOMIC_XCHG(&g_acc_y, 0);
+    drop_pending();
     suppress_held();
     ATOMIC_XCHG(&g_captured, 1);
     if (!said) {
@@ -355,8 +406,7 @@ static void release(void)
     ClipCursor(NULL);
     if (g_hwnd && GetCapture() == g_hwnd)
         ReleaseCapture();
-    ATOMIC_XCHG(&g_acc_x, 0);
-    ATOMIC_XCHG(&g_acc_y, 0);
+    drop_pending();
 }
 
 /* Everything let go: the window lost the focus, and the button-up messages
@@ -609,8 +659,7 @@ static void capture(void)
         fflush(stderr);
         return;
     }
-    ATOMIC_XCHG(&g_acc_x, 0);
-    ATOMIC_XCHG(&g_acc_y, 0);
+    drop_pending();
     g_suppress |= held_buttons();       /* the click that captured is not a shot */
     ATOMIC_XCHG(&g_captured, 1);
     if (!said) {
@@ -627,8 +676,7 @@ static void release(void)
         return;
     ATOMIC_XCHG(&g_captured, 0);
     SDL_SetRelativeMouseMode(SDL_FALSE);
-    ATOMIC_XCHG(&g_acc_x, 0);
-    ATOMIC_XCHG(&g_acc_y, 0);
+    drop_pending();
 }
 
 static void drop_buttons(void)

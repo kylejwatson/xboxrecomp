@@ -2043,6 +2043,11 @@ HLE_EXPORT(D3DDevice_Swap)
         QueryPerformanceCounter(&t1);
         HLE_CALL_ORIGINAL(D3DDevice_Swap);
         QueryPerformanceCounter(&t2);
+#if HLE_HOST_RENDERER
+        /* The frame boundary for mouse look: before the host presents,
+         * which is where a late host stalls (recomp_mouse.h). */
+        recomp_mouse_frame_mark();
+#endif
         g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
         g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
         g_swap_last = t2;
@@ -2094,6 +2099,9 @@ HLE_EXPORT(D3DDevice_Present)
         QueryPerformanceCounter(&t1);
         HLE_CALL_ORIGINAL(D3DDevice_Present);
         QueryPerformanceCounter(&t2);
+#if HLE_HOST_RENDERER
+        recomp_mouse_frame_mark();
+#endif
         g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
         g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
         g_swap_last = t2;

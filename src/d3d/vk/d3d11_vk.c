@@ -20,8 +20,11 @@
  * slice of that arena -- no wait, no copy -- and NO_OVERWRITE hands back the
  * same slice; when a frame's arena is recycled, a buffer still pointing into
  * it is moved to a private "home" allocation so its contents survive, as
- * D3D11's do. STAGING resources are host-visible buffers; Map(READ) waits for
- * the GPU only when a copy into the resource is still outstanding.
+ * D3D11's do. A large one (DYNAMIC_VERSION_MIN and up) has allocations of its
+ * own instead, one per DISCARD still in flight, so it is never moved: moving
+ * is a CPU read of write-combined memory, which is slow. STAGING resources
+ * are host-visible buffers; Map(READ) waits for the GPU only when a copy into
+ * the resource is still outstanding.
  *
  * Shaders arrive as SPIR-V (d3dcompiler_vk.c). Vertex inputs are matched to
  * input-layout elements, and pixel-shader inputs to vertex-shader outputs, by
@@ -56,6 +59,14 @@
 
 #define VK11_FRAMES        3
 #define ARENA_BLOCK_SIZE   (32u << 20)
+/* A DYNAMIC buffer this big takes its own allocations on Map(DISCARD), not
+ * the arena's (see Memory above). The title's 4 MB vertex and index rings
+ * are discarded every 12 frames or so and written with NO_OVERWRITE in
+ * between, so each sat in an arena when it was recycled, and copying it out
+ * of write-combined memory took 19 ms -- long enough for Future Perfect to
+ * read its vblank clock one tick late and step its world 3 ticks, then 1. */
+#define DYNAMIC_VERSION_MIN (256u << 10)
+#define DYNAMIC_VERSIONS   8
 #define VS_CBUFFER_BASE    VK11_BINDING_CBUFFER
 #define PS_CBUFFER_BASE    (VK11_BINDING_CBUFFER + VK11_MAX_CBUFFERS)
 #define DUMMY_VB_BINDING   15u
@@ -144,8 +155,17 @@ typedef struct Buffer {
     VkBuffer cur_buf;
     VkDeviceSize cur_off;
     uint8_t *cur_ptr;
-    int cur_slot;               /* -2 nothing yet, -1 home, else arena frame */
+    int cur_slot;               /* -2 nothing yet, -1 home or a version, else arena frame */
     struct Buffer *dyn_next, *dyn_prev;
+    /* DYNAMIC, DYNAMIC_VERSION_MIN and up: what Map(DISCARD) hands out. A
+     * version is free again once the GPU has finished frame busy_until. */
+    struct {
+        VkBuffer buf;
+        VkDeviceMemory mem;
+        uint8_t *ptr;
+        uint64_t busy_until;
+    } ver[DYNAMIC_VERSIONS];
+    int nver, cur_ver;          /* cur_ver -1: not on a version */
 } Buffer;
 
 typedef struct IoVar {
@@ -215,6 +235,7 @@ typedef struct Frame {
     VkFence fence;
     VkSemaphore acquired;
     int submitted;
+    uint64_t serial;            /* G.rec_serial when it was submitted */
     ArenaBlock *arena;          /* blocks in use this frame */
     VkDescriptorPool *dpools;
     int ndpools, capdpools, cur_dpool;
@@ -275,6 +296,8 @@ static struct {
     /* frames */
     Frame frames[VK11_FRAMES];
     int fi;
+    uint64_t rec_serial;        /* the frame being recorded; the first is 1 */
+    uint64_t done_serial;       /* every frame up to this one has finished */
     VkCommandBuffer cmd;        /* frames[fi].cmd while recording */
     ArenaBlock *free_blocks;
     Buffer *dyn_head;
@@ -792,6 +815,8 @@ static void frame_begin(int fi)
     if (f->submitted) {
         vkWaitForFences(G.dev, 1, &f->fence, VK_TRUE, UINT64_MAX);
         f->submitted = 0;
+        if (f->serial > G.done_serial)
+            G.done_serial = f->serial;
     }
     vkResetFences(G.dev, 1, &f->fence);
     garbage_run(f);
@@ -1878,6 +1903,7 @@ HRESULT vk11_dev_CreateBuffer(ID3D11Device *dev, const D3D11_BUFFER_DESC *d,
     }
     b->desc = *d;
     b->cur_slot = -2;
+    b->cur_ver = -1;
     switch (d->Usage) {
     case D3D11_USAGE_DYNAMIC:
         b->dyn_next = G.dyn_head;
@@ -1981,6 +2007,7 @@ static void destroy(Obj *o)
     switch (o->kind) {
     case K_BUFFER: {
         Buffer *b = (Buffer *)o;
+        int i;
         if (b->desc.Usage == D3D11_USAGE_DYNAMIC) {
             if (b->dyn_prev) b->dyn_prev->dyn_next = b->dyn_next;
             else G.dyn_head = b->dyn_next;
@@ -1990,6 +2017,10 @@ static void destroy(Obj *o)
         garbage_add(G_MEMORY, (uint64_t)b->mem);
         garbage_add(G_BUFFER, (uint64_t)b->home_buf);
         garbage_add(G_MEMORY, (uint64_t)b->home_mem);
+        for (i = 0; i < b->nver; i++) {
+            garbage_add(G_BUFFER, (uint64_t)b->ver[i].buf);
+            garbage_add(G_MEMORY, (uint64_t)b->ver[i].mem);
+        }
         break;
     }
     case K_TEXTURE: {
@@ -3426,6 +3457,35 @@ void vk11_ctx_ClearDepthStencilView(ID3D11DeviceContext *c, ID3D11DepthStencilVi
  * Context: memory
  * ====================================================================== */
 
+/* Map(DISCARD) of a large DYNAMIC buffer: point it at one of its own
+ * allocations that no frame still in flight reads. The one it leaves stays
+ * busy until the frame being recorded has finished. 0 when all are busy and
+ * none can be added; the arena takes it then. */
+static int dynamic_new_version(Buffer *b)
+{
+    int i;
+
+    if (b->cur_ver >= 0)
+        b->ver[b->cur_ver].busy_until = G.rec_serial;
+    b->cur_ver = -1;
+    for (i = 0; i < b->nver; i++)
+        if (b->ver[i].busy_until <= G.done_serial)
+            break;
+    if (i == b->nver) {
+        if (b->nver == DYNAMIC_VERSIONS ||
+            !make_buffer(b->desc.ByteWidth, ALL_BUFFER_USAGE, HOST_MEM,
+                         &b->ver[i].buf, &b->ver[i].mem, &b->ver[i].ptr))
+            return 0;
+        b->nver++;
+    }
+    b->cur_ver = i;
+    b->cur_buf = b->ver[i].buf;
+    b->cur_off = 0;
+    b->cur_ptr = b->ver[i].ptr;
+    b->cur_slot = -1;
+    return 1;
+}
+
 HRESULT vk11_ctx_Map(ID3D11DeviceContext *c, ID3D11Resource *res, UINT sub, D3D11_MAP type,
                      UINT flags, D3D11_MAPPED_SUBRESOURCE *out)
 {
@@ -3440,7 +3500,8 @@ HRESULT vk11_ctx_Map(ID3D11DeviceContext *c, ID3D11Resource *res, UINT sub, D3D1
     if (o->kind == K_BUFFER) {
         Buffer *b = (Buffer *)o;
         if (b->desc.Usage == D3D11_USAGE_DYNAMIC) {
-            if (type == D3D11_MAP_WRITE_DISCARD || b->cur_slot == -2) {
+            if ((type == D3D11_MAP_WRITE_DISCARD || b->cur_slot == -2) &&
+                !(b->desc.ByteWidth >= DYNAMIC_VERSION_MIN && dynamic_new_version(b))) {
                 VkBuffer buf;
                 VkDeviceSize off;
                 VkDeviceSize align = G.props.limits.minUniformBufferOffsetAlignment;
@@ -3838,6 +3899,7 @@ HRESULT D3D11CreateDeviceAndSwapChain(
             goto fail;
         pipeline_cache_init();
         G.fi = 0;
+        G.rec_serial = 1;
         begin_commands();
         if (!create_defaults())
             goto fail;
@@ -4001,6 +4063,7 @@ HRESULT vk11_swap_Present(IDXGISwapChain *sc, UINT interval, UINT flags)
         fflush(stderr);
     }
     f->submitted = r == VK_SUCCESS;
+    f->serial = G.rec_serial++;
     if (idx != UINT32_MAX && r == VK_SUCCESS) {
         VkPresentInfoKHR pi;
         memset(&pi, 0, sizeof pi);

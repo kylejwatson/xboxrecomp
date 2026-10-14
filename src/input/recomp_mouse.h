@@ -95,8 +95,20 @@ void recomp_mouse_feed_motion(long dx, long dy);
  * frame. Counts left untaken for more than a quarter of a second -- a pause,
  * a cutscene, a menu, anywhere the hook does not run -- are dropped rather
  * than handed over as one jump when it runs again. Returns 1 if either is
- * non-zero. */
+ * non-zero.
+ *
+ * "Since the last call" ends at the last recomp_mouse_frame_mark when there
+ * has been one since then; what came after it is the next frame's. */
 int  recomp_mouse_take_motion(long *dx, long *dy);
+
+/* A frame boundary: the title's Swap, after the gate let it through and
+ * before the host presents (src/hle/hle_d3d8.c). The game's own clock
+ * steps from one Swap to the next, so cutting the mouse here keeps a turn
+ * in step with walking and everything else in the frame. Cutting it where
+ * the look hook runs instead put the host's lateness into the turn: a
+ * present that blocked 20 ms gave the next frame 55 ms of turning while the
+ * game moved the player by its usual 33, and turning while walking juddered. */
+void recomp_mouse_frame_mark(void);
 
 /* A second copy of every count fed, for RECOMP_INPUT_RECORD (input_host.c):
  * switch it on once, then drain it each pad sample. Taking these does not
