@@ -275,6 +275,104 @@ int recomp_mouse_source(int which)
     return on ? 255 : 0;
 }
 
+/* ---- pointer mode ------------------------------------------------------ */
+
+static mouse_atomic g_pointer;          /* a menu takes the mouse as a pointer */
+static mouse_atomic g_ptr_moves, g_ptr_clicks, g_ptr_held, g_ptr_wheel;
+static int g_ptr_recapture;             /* window thread: capture again when it goes off */
+/* The pointer in the window and the picture in the window, as fractions.
+ * Written by one thread each, read by the title's; a pointer a frame old,
+ * or a coordinate pair torn between two events, is harmless. */
+static volatile float g_ptr_win[2] = { -1.0f, -1.0f };
+static volatile float g_pic[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+
+static void pointer_mode_apply(void *unused);  /* the window section below */
+
+void recomp_mouse_set_pointer_mode(int on)
+{
+    on = on ? 1 : 0;
+    if ((g_pointer != 0) == on)
+        return;
+    ATOMIC_XCHG(&g_pointer, on);
+    pointer_mode_apply(NULL);
+}
+
+int recomp_mouse_pointer_mode(void)
+{
+    return g_pointer != 0;
+}
+
+void recomp_mouse_set_picture(const float rect[4])
+{
+    int i;
+
+    if (!rect || !(rect[2] > 0.0f) || !(rect[3] > 0.0f))
+        return;
+    for (i = 0; i < 4; i++)
+        g_pic[i] = rect[i];
+}
+
+int recomp_mouse_pointer(float *x, float *y)
+{
+    float wx = g_ptr_win[0], wy = g_ptr_win[1];
+    float px, py;
+    int in;
+
+    if (wx < 0.0f || wy < 0.0f) {
+        if (x) *x = 0.5f;
+        if (y) *y = 0.5f;
+        return 0;
+    }
+    px = (wx - g_pic[0]) / g_pic[2];
+    py = (wy - g_pic[1]) / g_pic[3];
+    in = px >= 0.0f && px < 1.0f && py >= 0.0f && py < 1.0f;
+    if (x) *x = px < 0.0f ? 0.0f : px > 1.0f ? 1.0f : px;
+    if (y) *y = py < 0.0f ? 0.0f : py > 1.0f ? 1.0f : py;
+    return in;
+}
+
+long recomp_mouse_pointer_take_moves(void)
+{
+    return ATOMIC_XCHG(&g_ptr_moves, 0);
+}
+
+long recomp_mouse_pointer_take_clicks(long *held, int *wheel)
+{
+    long c = ATOMIC_XCHG(&g_ptr_clicks, 0);
+
+    if (held)
+        *held = g_ptr_held;
+    if (wheel)
+        *wheel = (int)ATOMIC_XCHG(&g_ptr_wheel, 0);
+    return c;
+}
+
+/* A button went down or up while the pointer is the menu's. */
+static void pointer_button(long bit, int down)
+{
+    if (down) {
+        ATOMIC_OR(&g_ptr_clicks, bit);
+        ATOMIC_OR(&g_ptr_held, bit);
+    } else {
+        ATOMIC_AND(&g_ptr_held, ~bit);
+    }
+}
+
+void recomp_mouse_script_pointer(float x, float y)
+{
+    g_ptr_win[0] = g_pic[0] + x * g_pic[2];
+    g_ptr_win[1] = g_pic[1] + y * g_pic[3];
+    ATOMIC_ADD(&g_ptr_moves, 1);
+}
+
+void recomp_mouse_script_button(int which, int down)
+{
+    if (g_pointer && which >= RECOMP_MOUSE_LEFT && which <= RECOMP_MOUSE_X2)
+        pointer_button(1L << which, down);
+    else if (g_pointer && down && (which == RECOMP_MOUSE_WHEEL_UP || which == RECOMP_MOUSE_WHEEL_DOWN))
+        ATOMIC_ADD(&g_ptr_wheel, which == RECOMP_MOUSE_WHEEL_UP ? 1 : -1);
+}
+
 /* ---- the window -------------------------------------------------------- */
 
 #if defined(_WIN32)
@@ -383,6 +481,10 @@ static void capture(HWND hwnd)
 
     if (!recomp_mouse_look_active() || g_captured)
         return;
+    if (g_pointer) {
+        g_ptr_recapture = 1;            /* once the menu has let the mouse go */
+        return;
+    }
     if (GetForegroundWindow() != hwnd || IsIconic(hwnd))
         return;
     clip_to_client(hwnd);
@@ -414,7 +516,35 @@ static void release(void)
 static void drop_buttons(void)
 {
     ATOMIC_XCHG(&g_buttons, 0);
+    ATOMIC_XCHG(&g_ptr_held, 0);
     g_suppress = 0;
+}
+
+/* The cursor's place in the client area, as fractions of it. */
+static void pointer_track(HWND hwnd)
+{
+    POINT pt;
+    RECT rc;
+
+    if (!GetCursorPos(&pt) || !ScreenToClient(hwnd, &pt) || !GetClientRect(hwnd, &rc) ||
+        rc.right <= rc.left || rc.bottom <= rc.top ||
+        pt.x < rc.left || pt.x >= rc.right || pt.y < rc.top || pt.y >= rc.bottom) {
+        g_ptr_win[0] = g_ptr_win[1] = -1.0f;
+        return;
+    }
+    g_ptr_win[0] = (float)(pt.x - rc.left) / (float)(rc.right - rc.left);
+    g_ptr_win[1] = (float)(pt.y - rc.top) / (float)(rc.bottom - rc.top);
+}
+
+/* Pointer mode came on or went off: the window thread does the rest
+ * (WM_POINTER_MODE below), since capture and release belong to it. */
+#define WM_POINTER_MODE (WM_APP + 0x3A1)
+
+static void pointer_mode_apply(void *unused)
+{
+    (void)unused;
+    if (g_hwnd)
+        PostMessageA(g_hwnd, WM_POINTER_MODE, 0, 0);
 }
 
 static void raw_mouse(HWND hwnd, const RAWMOUSE *m)
@@ -461,6 +591,24 @@ static void raw_mouse(HWND hwnd, const RAWMOUSE *m)
     }
     went_down = logical_buttons(went_down);
     went_up = logical_buttons(went_up);
+
+    if (g_pointer) {
+        /* A menu has the mouse: the buttons and the wheel are its, and a
+         * click is not a capture. */
+        pointer_track(hwnd);
+        if (dx || dy)
+            ATOMIC_ADD(&g_ptr_moves, 1);
+        if (went_up) {
+            ATOMIC_AND(&g_buttons, ~went_up);
+            g_suppress &= ~went_up;
+            pointer_button(went_up, 0);
+        }
+        if (went_down && cursor_in_client(hwnd))
+            pointer_button(went_down, 1);
+        if ((f & RI_MOUSE_WHEEL) && (SHORT)m->usButtonData && cursor_in_client(hwnd))
+            ATOMIC_ADD(&g_ptr_wheel, (SHORT)m->usButtonData > 0 ? 1 : -1);
+        return;
+    }
 
     if (went_up) {
         ATOMIC_AND(&g_buttons, ~went_up);
@@ -546,7 +694,20 @@ int recomp_mouse_window_message(void *hwnd_ptr, unsigned msg, uintptr_t wp,
             raw_mouse(hwnd, &ri.data.mouse);
         return 0;                       /* DefWindowProc frees the input */
     }
+    case WM_POINTER_MODE:
+        if (g_pointer) {
+            if (g_captured)
+                g_ptr_recapture = 1;
+            release();
+            pointer_track(hwnd);
+        } else if (g_ptr_recapture) {
+            g_ptr_recapture = 0;
+            capture(hwnd);
+        }
+        return 0;
     case WM_ACTIVATE:
+        if (g_pointer && LOWORD(wp) != WA_INACTIVE)
+            return 0;                   /* the menu keeps the cursor free */
         if (LOWORD(wp) == WA_INACTIVE) {
             release();
             drop_buttons();
@@ -577,6 +738,8 @@ int recomp_mouse_window_message(void *hwnd_ptr, unsigned msg, uintptr_t wp,
         }
         return 0;
     case WM_KEYDOWN:
+        if (wp == MOUSE_RELEASE_VK && g_pointer)
+            return 0;                   /* nothing captured to let go */
         if (wp == MOUSE_RELEASE_VK && !(lp & (1 << 30)) && recomp_mouse_look_active()) {
             if (g_captured)
                 release();
@@ -652,6 +815,10 @@ static void capture(void)
 
     if (!g_win || !recomp_mouse_look_active() || g_captured)
         return;
+    if (g_pointer) {
+        g_ptr_recapture = 1;            /* once the menu has let the mouse go */
+        return;
+    }
     if (!(SDL_GetWindowFlags(g_win) & SDL_WINDOW_INPUT_FOCUS))
         return;
     if (SDL_SetRelativeMouseMode(SDL_TRUE) != 0) {
@@ -682,7 +849,48 @@ static void release(void)
 static void drop_buttons(void)
 {
     ATOMIC_XCHG(&g_buttons, 0);
+    ATOMIC_XCHG(&g_ptr_held, 0);
     g_suppress = 0;
+}
+
+static void pointer_at(int x, int y)
+{
+    int w = 0, h = 0;
+
+    if (g_win)
+        SDL_GetWindowSize(g_win, &w, &h);
+    if (w <= 0 || h <= 0 || x < 0 || y < 0 || x >= w || y >= h) {
+        g_ptr_win[0] = g_ptr_win[1] = -1.0f;
+        return;
+    }
+    g_ptr_win[0] = (float)x / (float)w;
+    g_ptr_win[1] = (float)y / (float)h;
+}
+
+/* On the event thread, which owns the relative mode. */
+static void pointer_mode_on_event_thread(void *unused)
+{
+    int x, y;
+
+    (void)unused;
+    if (g_pointer) {
+        if (g_captured)
+            g_ptr_recapture = 1;
+        release();
+        SDL_GetMouseState(&x, &y);
+        if (SDL_GetMouseFocus() == g_win)
+            pointer_at(x, y);
+    } else if (g_ptr_recapture) {
+        g_ptr_recapture = 0;
+        capture();
+    }
+}
+
+static void pointer_mode_apply(void *unused)
+{
+    (void)unused;
+    if (g_attached)
+        host_sdl_run_on_event_thread(pointer_mode_on_event_thread, NULL);
 }
 
 static int sdl_event(const void *ev)
@@ -691,6 +899,44 @@ static int sdl_event(const void *ev)
     const int look = recomp_mouse_look_active();
     long bit;
 
+    if (g_pointer) {
+        /* A menu has the mouse: its buttons and wheel are the menu's, a
+         * click is not a capture, and the window keeps the cursor free. */
+        switch (e->type) {
+        case SDL_MOUSEMOTION:
+            pointer_at(e->motion.x, e->motion.y);
+            ATOMIC_ADD(&g_ptr_moves, 1);
+            return 0;
+        case SDL_MOUSEBUTTONDOWN:
+        case SDL_MOUSEBUTTONUP:
+            bit = button_bit(e->button.button);
+            pointer_at(e->button.x, e->button.y);
+            if (e->type == SDL_MOUSEBUTTONUP) {
+                ATOMIC_AND(&g_buttons, ~bit);
+                g_suppress &= ~bit;
+            }
+            pointer_button(bit, e->type == SDL_MOUSEBUTTONDOWN);
+            return 0;
+        case SDL_MOUSEWHEEL: {
+            int dy = e->wheel.y;
+            if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
+                dy = -dy;
+            if (dy)
+                ATOMIC_ADD(&g_ptr_wheel, dy > 0 ? 1 : -1);
+            return 0;
+        }
+        case SDL_WINDOWEVENT:
+            if (e->window.event == SDL_WINDOWEVENT_LEAVE)
+                g_ptr_win[0] = g_ptr_win[1] = -1.0f;
+            else if (e->window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                drop_buttons();
+            return 0;
+        case SDL_KEYDOWN:
+            return e->key.keysym.scancode == SDL_SCANCODE_F8;
+        default:
+            return 0;
+        }
+    }
     switch (e->type) {
     case SDL_MOUSEMOTION:
         if (look && g_captured)

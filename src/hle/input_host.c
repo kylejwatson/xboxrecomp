@@ -48,7 +48,7 @@ enum {
  * a menu but not a place in a level, and "walk to where it looks wrong" is
  * how a rendering bug gets reproduced without a person at the pad. The names
  * match the controls in the binding config (src/input/input_bindings.c). */
-enum { FAKE_BUTTON, FAKE_ANALOG, FAKE_STICK, FAKE_MOUSE };
+enum { FAKE_BUTTON, FAKE_ANALOG, FAKE_STICK, FAKE_MOUSE, FAKE_CLICK };
 enum { STICK_LX, STICK_LY, STICK_RX, STICK_RY };
 /* FAKE_MOUSE: mouse movement while held, at SEQ_MOUSE_RATE counts a second
  * (RECOMP_INPUT_SEQ_MOUSE_RATE overrides), for a title with a mouse-look hook. */
@@ -69,6 +69,8 @@ static const struct { const char *name; int kind; unsigned value; int sign; } FA
     { "rstick_left",  FAKE_STICK, STICK_RX, -1 }, { "rstick_right", FAKE_STICK, STICK_RX,  1 },
     { "mouse_up",     FAKE_MOUSE, MOUSE_DIR_Y, -1 }, { "mouse_down",  FAKE_MOUSE, MOUSE_DIR_Y,  1 },
     { "mouse_left",   FAKE_MOUSE, MOUSE_DIR_X, -1 }, { "mouse_right", FAKE_MOUSE, MOUSE_DIR_X,  1 },
+    { "click",        FAKE_CLICK, RECOMP_MOUSE_LEFT, 0 }, { "rclick",    FAKE_CLICK, RECOMP_MOUSE_RIGHT, 0 },
+    { "wheel_up",     FAKE_CLICK, RECOMP_MOUSE_WHEEL_UP, 0 }, { "wheel_down", FAKE_CLICK, RECOMP_MOUSE_WHEEL_DOWN, 0 },
 };
 
 /* Name -> FAKE index, or -1. `n` is the name's length inside a longer spec. */
@@ -98,6 +100,7 @@ static void fake_apply(RecompInputGamepad *g, int i)
         }
         break;
     case FAKE_MOUSE:
+    case FAKE_CLICK:
         break;                  /* fed by time in seq_input, not per sample */
     default:
         g->buttons |= (uint16_t)FAKE[i].value;
@@ -123,7 +126,14 @@ static void fake_apply(RecompInputGamepad *g, int i)
  * is how a run gets back to the same screen. The sequence is the save state.
  * Nothing is pressed after the last step ends. */
 #define SEQ_MAX 128
-static struct seq_step { unsigned long at, hold; int keys[4]; int nkeys; } s_seq[SEQ_MAX];
+/* ptr_<x>_<y> (a step of its own or with others): the menu pointer to x%, y%
+ * of the picture, for a title whose menus take the mouse as a pointer; click
+ * and rclick press the left and right buttons there, wheel_up and wheel_down
+ * turn the wheel a notch (recomp_mouse.h). */
+static struct seq_step {
+    unsigned long at, hold; int keys[4]; int nkeys;
+    int has_ptr; float ptr_x, ptr_y;
+} s_seq[SEQ_MAX];
 static int s_seq_count = -1;
 static unsigned long long s_seq_t0;
 
@@ -152,6 +162,21 @@ static void seq_parse(const char *env)
             int k;
             while (q + n < p + len && q[n] != '+' && q[n] != ':')
                 n++;
+            if (n > 4 && strncmp(q, "ptr_", 4) == 0) {
+                float x, y;
+                if (sscanf(q + 4, "%f_%f", &x, &y) != 2) {
+                    fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ: bad pointer '%.*s' (want ptr_<x%%>_<y%%>)\n",
+                            (int)n, q);
+                    return;
+                }
+                s->has_ptr = 1;
+                s->ptr_x = x / 100.0f;
+                s->ptr_y = y / 100.0f;
+                q += n;
+                if (q < p + len && *q == '+')
+                    q++;
+                continue;
+            }
             k = fake_lookup(q, n);
             if (k < 0) {
                 fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ: unknown button '%.*s'\n", (int)n, q);
@@ -263,9 +288,18 @@ static void seq_input(RecompInputGamepad *g)
         unsigned long long end = (unsigned long long)s_seq[i].at + s_seq[i].hold;
         if (t < s_seq[i].at || prev_t >= end)
             continue;
+        /* The pointer is placed, and a click pressed, once at the start of
+         * the step; the click is let go at its end. */
+        if (s_seq[i].has_ptr && (prev_t < s_seq[i].at || !prev_t))
+            recomp_mouse_script_pointer(s_seq[i].ptr_x, s_seq[i].ptr_y);
         for (k = 0; k < s_seq[i].nkeys; k++) {
             int f = s_seq[i].keys[k];
-            if (FAKE[f].kind == FAKE_MOUSE) {
+            if (FAKE[f].kind == FAKE_CLICK) {
+                if (prev_t < s_seq[i].at || !prev_t)
+                    recomp_mouse_script_button((int)FAKE[f].value, 1);
+                if (t >= end)
+                    recomp_mouse_script_button((int)FAKE[f].value, 0);
+            } else if (FAKE[f].kind == FAKE_MOUSE) {
                 /* The part of this step's hold that fell since the last
                  * sample, as counts: the same total however often the
                  * title polls. */

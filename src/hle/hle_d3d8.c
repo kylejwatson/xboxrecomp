@@ -81,6 +81,19 @@
 #include "platform/host_sdl.h"
 #endif
 
+#if HLE_HOST_RENDERER
+/* The frame boundary for mouse look, and where the picture now sits in the
+ * window for a title that reads the pointer (recomp_mouse.h). */
+static void mouse_frame_mark(void)
+{
+    float pic[4];
+
+    recomp_mouse_frame_mark();
+    xbox_D3D8GetPictureRect(pic);
+    recomp_mouse_set_picture(pic);
+}
+#endif
+
 static void first_call(int *seen, const char *name, uint32_t arg)
 {
     if (!*seen) {
@@ -2079,7 +2092,7 @@ HLE_EXPORT(D3DDevice_Swap)
 #if HLE_HOST_RENDERER
         /* The frame boundary for mouse look: before the host presents,
          * which is where a late host stalls (recomp_mouse.h). */
-        recomp_mouse_frame_mark();
+        mouse_frame_mark();
 #endif
         g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
         g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
@@ -2133,7 +2146,7 @@ HLE_EXPORT(D3DDevice_Present)
         HLE_CALL_ORIGINAL(D3DDevice_Present);
         QueryPerformanceCounter(&t2);
 #if HLE_HOST_RENDERER
-        recomp_mouse_frame_mark();
+        mouse_frame_mark();
 #endif
         g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
         g_swap_body_ticks += t2.QuadPart - t1.QuadPart;

@@ -124,6 +124,45 @@ double recomp_mouse_counts_to_degrees(long counts);
  * title that acts on the press edge sees every notch. */
 int  recomp_mouse_source(int which);
 
+/* ---- Pointer mode: menus that take the mouse as a pointer ----
+ *
+ * A title whose menus can follow a pointer turns this on while one is up
+ * and off when it goes. On: the cursor is let go (shown, and free to leave
+ * the window), mouse buttons and the wheel stop reaching their bindings --
+ * a click in a menu is not a shot -- and the title reads the pointer and
+ * its clicks below. Off: if the cursor was captured when pointer mode came
+ * on it is captured again, the click that is held then not passed on. Any
+ * thread; cheap to call every frame with the same value. */
+void recomp_mouse_set_pointer_mode(int on);
+int  recomp_mouse_pointer_mode(void);
+
+/* Where the picture sits in the window, as fractions of it (x, y, width,
+ * height), from the renderer at each present: the pointer is measured
+ * against the picture, not the bars around it. */
+void recomp_mouse_set_picture(const float rect[4]);
+
+/* The pointer over the picture, 0..1 across and down. Returns 0 (and the
+ * nearest point of the picture) when it is outside the picture or the
+ * window, or nothing is known yet. */
+int  recomp_mouse_pointer(float *x, float *y);
+
+/* Pointer movements since the last call: how a title tells that the mouse,
+ * not the pad, is being used. */
+long recomp_mouse_pointer_take_moves(void);
+
+/* Pointer-mode buttons pressed since the last call (bit per RECOMP_MOUSE_LEFT
+ * ..X2); *held gets those down now, *wheel the wheel notches since the last
+ * call (up positive). */
+long recomp_mouse_pointer_take_clicks(long *held, int *wheel);
+
+/* Scripted pointer input (RECOMP_INPUT_SEQ's ptr_<x>_<y>, click and rclick
+ * steps): the pointer put at a point of the picture (0..1 across and down),
+ * and a button pressed or let go (a wheel source turns one notch when
+ * pressed), as if the mouse had done it. Outside pointer mode these do
+ * nothing. */
+void recomp_mouse_script_pointer(float x, float y);
+void recomp_mouse_script_button(int which, int down);
+
 #ifdef __cplusplus
 }
 #endif

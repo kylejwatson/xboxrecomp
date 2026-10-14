@@ -1188,6 +1188,12 @@ void xbox_D3D8WindowSize(UINT guest_w, UINT guest_h, UINT *width, UINT *height);
  * which the title's viewports, scissors and clear rectangles on its levels
  * are measured in. */
 void xbox_D3D8SetTextureTexelSize(IDirect3DTexture8 *texture, UINT width, UINT height);
+/* Where the picture sat in the window at the last present, as fractions of
+ * the window: x, y, width, height. The whole window (0,0,1,1) until a
+ * scaled present has fitted it, and whenever the shapes agree; otherwise
+ * the rest is the bars. For a title that reads the pointer: a window
+ * position becomes a position on the guest's screen through this. */
+void xbox_D3D8GetPictureRect(float rect[4]);
 
 /* The Xbox's D3DDevice_SetScissors: clip drawing to the rectangles (or, with
  * exclusive set, outside them); count 0 turns it off. The host applies one

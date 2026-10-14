@@ -289,6 +289,19 @@ static float rt_scale_y(void)
     return (float)g_device_state.height / (float)g_device_state.present_height;
 }
 
+/* The last fit, as fractions of the back buffer (xbox_D3D8GetPictureRect).
+ * Written on the presenting thread, read by others: four floats that may be
+ * a frame apart from each other, which a pointer never notices. */
+static volatile float g_picture[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+
+void xbox_D3D8GetPictureRect(float rect[4])
+{
+    int i;
+
+    for (i = 0; i < 4; i++)
+        rect[i] = g_picture[i];
+}
+
 /* Put the scene on the back buffer, immediately before presenting it.
  * Nothing to do while unscaled: the scene target is the back buffer, and
  * this is the one call that has to stay free in that case. */
@@ -348,6 +361,12 @@ static void present_resolve(void)
 
         d3d8_display_output_shape(s->width, s->height, &shape_w, &shape_h);
         fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
+    }
+    if (s->swap_width && s->swap_height) {
+        g_picture[0] = (float)fit.x / (float)s->swap_width;
+        g_picture[1] = (float)fit.y / (float)s->swap_height;
+        g_picture[2] = (float)fit.w / (float)s->swap_width;
+        g_picture[3] = (float)fit.h / (float)s->swap_height;
     }
     d3d8_display_resolve(d3d8_GetSceneSRV(), s->width, s->height, s->present_rtv, fit);
 }
