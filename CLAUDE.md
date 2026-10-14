@@ -132,7 +132,12 @@ natively. **Oct 2026 (Future Perfect):** `RECOMP_RES_SCALE` also takes a height 
 widescreen), frame-buffer textures are made at the scene size (`hle_d3d8_fb_host_size`,
 texel size kept as the guest's), the 2D squeeze applies only under Hor+, and
 `AV_OPTION_QUERY_AVPACK` carries the widescreen bit, without which D3D refuses a
-`D3DPRESENTFLAG_WIDESCREEN` device.
+`D3DPRESENTFLAG_WIDESCREEN` device. The title's own 2D render targets and scratch
+targets are scaled with the scene too (`hle_d3d8_rt_host_size`, `RECOMP_RT_SCALE=0`
+to keep guest sizes); a surface's `guest_width/height` drives `rt_scale_x/y`. Cubes are
+not scaled. **MSAA:** `RECOMP_MSAA=2|4|8` multisamples the scene and device depth, and
+`d3d8_GetSceneSRV`/`d3d8_GetSceneTexture` resolve on every call, so readers never see the
+multisampled image; the Vulkan backend supports multisampled targets for this.
 
 **Input is bound, not hard-coded (Sep 2026):** all four ports read
 `src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else

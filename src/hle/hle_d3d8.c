@@ -564,6 +564,34 @@ void hle_d3d8_fb_host_size(UINT w, UINT h, UINT *host_w, UINT *host_h)
     if (!*host_h) *host_h = 1;
 }
 
+void hle_d3d8_rt_host_size(UINT w, UINT h, UINT *host_w, UINT *host_h)
+{
+    static int on = -1;
+
+    /* The title's own render passes -- Future Perfect's uplink map, copied
+     * out of a corner of the screen into 128x128 and 640x480 textures,
+     * its full-screen effects -- scale with the scene. At guest size each
+     * of them is a 640x480-or-smaller picture magnified into a sharp
+     * frame, and the map lost the thin lines of its walls altogether. */
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_RT_SCALE", 1);
+    *host_w = w;
+    *host_h = h;
+    if (!on)
+        return;
+    hle_d3d8_fb_host_size(w, h, host_w, host_h);
+    /* A big shadow map at 4K would be 6144 wide; past 8192 the size is
+     * memory nobody sees, and some hosts refuse it. Kept in proportion. */
+    if (*host_w > 8192 || *host_h > 8192) {
+        uint64_t k = *host_w > *host_h ? *host_w : *host_h;
+
+        *host_w = (UINT)(((uint64_t)*host_w * 8192) / k);
+        *host_h = (UINT)(((uint64_t)*host_h * 8192) / k);
+        if (*host_w < w) *host_w = w;
+        if (*host_h < h) *host_h = h;
+    }
+}
+
 IDirect3DTexture8 *hle_d3d8_fb_kept(uint32_t phys)
 {
     int i;
@@ -3102,7 +3130,7 @@ int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va,
 #define SURFACE_PARENT 20
 
 static struct { UINT width, height; IDirect3DTexture8 *texture; } g_scratch[SHADOW_SCRATCH];
-static struct { UINT width, height; IDirect3DSurface8 *surface; } g_depths[SHADOW_SCRATCH];
+static struct { UINT width, height; D3DMULTISAMPLE_TYPE ms; IDirect3DSurface8 *surface; } g_depths[SHADOW_SCRATCH];
 
 static void surface_measure(uint32_t va, UINT *w, UINT *h, uint32_t *fmt)
 {
@@ -3137,10 +3165,15 @@ static IDirect3DTexture8 *scratch_target(UINT w, UINT h)
     for (i = 0; i < SHADOW_SCRATCH; i++) {
         if (g_scratch[i].texture)
             continue;
-        if (FAILED(host_CreateTexture(g_shadow, w, h, 1, D3DUSAGE_RENDERTARGET,
+        UINT hw, hh;
+
+        hle_d3d8_rt_host_size(w, h, &hw, &hh);
+        if (FAILED(host_CreateTexture(g_shadow, hw, hh, 1, D3DUSAGE_RENDERTARGET,
                                       D3DFMT_LIN_X8R8G8B8, D3DPOOL_DEFAULT,
                                       &g_scratch[i].texture)))
             return g_scratch[i].texture = NULL;
+        if (hw != w || hh != h)
+            xbox_D3D8SetTextureTexelSize(g_scratch[i].texture, w, h);
         g_scratch[i].width = w;
         g_scratch[i].height = h;
         return g_scratch[i].texture;
@@ -3148,22 +3181,28 @@ static IDirect3DTexture8 *scratch_target(UINT w, UINT h)
     return NULL;
 }
 
-static IDirect3DSurface8 *depth_surface(UINT w, UINT h)
+/* A host depth surface of w x h (host pixels), with ms samples: the screen's
+ * when it is to be bound with the screen (xbox_D3D8SceneMultisample), one
+ * otherwise. The host refuses depth that differs from its target in
+ * either. */
+static IDirect3DSurface8 *depth_surface(UINT w, UINT h, D3DMULTISAMPLE_TYPE ms)
 {
     int i;
 
     for (i = 0; i < SHADOW_SCRATCH; i++) {
-        if (g_depths[i].surface && g_depths[i].width == w && g_depths[i].height == h)
+        if (g_depths[i].surface && g_depths[i].width == w && g_depths[i].height == h &&
+            g_depths[i].ms == ms)
             return g_depths[i].surface;
     }
     for (i = 0; i < SHADOW_SCRATCH; i++) {
         if (g_depths[i].surface)
             continue;
-        if (FAILED(host_CreateDepthStencilSurface(g_shadow, w, h, D3DFMT_D24S8,
+        if (FAILED(host_CreateDepthStencilSurface(g_shadow, w, h, D3DFMT_D24S8, ms,
                                                   &g_depths[i].surface)))
             return g_depths[i].surface = NULL;
         g_depths[i].width = w;
         g_depths[i].height = h;
+        g_depths[i].ms = ms;
         return g_depths[i].surface;
     }
     return NULL;
@@ -3309,7 +3348,28 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         surface_measure(zs, &zw, &zh, &zfmt);
         g_z_scale = xbox_depth_z_scale(zfmt);
         own = g_autodepth_va ? zs == g_autodepth_va : (zw == w && zh == h);
-        depth = (kind == 0 && own && g_device_depth) ? g_device_depth : depth_surface(w, h);
+        if (kind == 0 && own && g_device_depth) {
+            depth = g_device_depth;
+        } else {
+            /* At the host target's size, which is bigger than w x h when
+             * the target was scaled with the scene: the host refuses depth
+             * of any other size. */
+            UINT tw = w, th = h;
+            D3DMULTISAMPLE_TYPE ms = D3DMULTISAMPLE_NONE;
+
+            if ((kind == 1 || kind == 2) && texture) {
+                D3DSURFACE_DESC d;
+
+                if (SUCCEEDED(texture->lpVtbl->GetLevelDesc(texture, level, &d))) {
+                    tw = d.Width;
+                    th = d.Height;
+                }
+            } else if (kind == 0) {
+                xbox_D3D8GetSceneSize(&tw, &th);
+                ms = xbox_D3D8SceneMultisample();
+            }
+            depth = depth_surface(tw, th, ms);
+        }
     } else {
         g_z_scale = 1.0f;
     }

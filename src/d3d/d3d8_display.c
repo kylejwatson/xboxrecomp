@@ -92,6 +92,19 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
             g_policy.anisotropy = (UINT)a;
         }
 
+        g_policy.msaa = 1;
+        v = recomp_config_lookup("RECOMP_MSAA", "msaa");
+        if (v && *v) {
+            long m = strtol(v, NULL, 10);
+
+            if (m != 1 && m != 2 && m != 4 && m != 8) {
+                fprintf(stderr, "D3D8 display: RECOMP_MSAA=%s is not 1, 2, 4 or 8; "
+                        "no multisampling\n", v);
+                m = 1;
+            }
+            g_policy.msaa = (UINT)m;
+        }
+
         g_policy.widescreen = recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0);
         if (g_policy.target_height)
             fprintf(stderr, "D3D8 display: rendering %u lines high, filtered to the "
@@ -104,6 +117,9 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
             fprintf(stderr, "D3D8 display: widescreen, so the title's frame is presented "
                     "at 16:9. A title with no 16:9 mode of its own draws 4:3 and will "
                     "look stretched; leave this off for those.\n");
+        if (g_policy.msaa > 1)
+            fprintf(stderr, "D3D8 display: %ux multisampling asked for the scene\n",
+                    g_policy.msaa);
         if (g_policy.anisotropy > 1)
             fprintf(stderr, "D3D8 display: anisotropic filtering forced to %ux where the "
                     "title filters linearly\n", g_policy.anisotropy);

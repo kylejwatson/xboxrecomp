@@ -68,6 +68,7 @@ typedef struct RecompSettings {
     double hor_plus;            /* 0 leaves the camera alone; 0.75 is 4:3->16:9 */
     int  hor_plus_register;     /* per title; 60 for TimeSplitters 2 */
     int  anisotropy;            /* 1..16 */
+    int  msaa;                  /* 1, 2, 4 or 8 samples per pixel */
     char frame_cap[16];         /* "adaptive", "60", "30", "0" */
     int  fps_overlay;           /* 0 or 1 */
     char game_dir[512];         /* empty means beside the executable */

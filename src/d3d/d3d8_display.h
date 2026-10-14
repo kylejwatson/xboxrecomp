@@ -42,6 +42,12 @@ typedef struct D3D8DisplayPolicy {
      * already filters linearly. 1 leaves every sampler as the title asked
      * for it. */
     UINT anisotropy;
+    /* RECOMP_MSAA=<1|2|4|8>: samples per pixel of the scene target and its
+     * depth (multisample antialiasing). 1 is none. It smooths geometry
+     * edges only, where supersampling (a larger scene) smooths everything,
+     * and the two combine. The title's own offscreen targets stay single
+     * sampled; whatever reads the scene reads it resolved. */
+    UINT msaa;
 } D3D8DisplayPolicy;
 
 const D3D8DisplayPolicy *d3d8_display_policy(void);

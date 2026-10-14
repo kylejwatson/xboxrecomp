@@ -116,6 +116,10 @@ typedef struct Image {
     D3D11_TEXTURE3D_DESC d3;
     Fmt f;
     uint32_t w, h, depth, mips, layers;
+    /* Samples per pixel: 1, or a multisampled render target or depth
+     * buffer (SampleDesc.Count), which is drawn into and resolved, never
+     * sampled or copied. */
+    uint32_t samples;
     VkImage img;
     VkDeviceMemory mem;
     /* USAGE_STAGING: a host buffer holding subresource 0, tightly pitched. */
@@ -252,6 +256,7 @@ typedef struct PipeKey {
     uint32_t nrt;
     VkFormat rt[8];
     VkFormat dsfmt;
+    uint32_t samples;           /* of the pass's attachments */
 } PipeKey;
 
 typedef struct PipeEntry {
@@ -1534,7 +1539,12 @@ static Image *image_new(int is3d, const D3D11_TEXTURE2D_DESC *d2, const D3D11_TE
         im->w = d2->Width; im->h = d2->Height; im->depth = 1;
         im->layers = d2->ArraySize ? d2->ArraySize : 1;
         im->mips = d2->MipLevels;
+        im->samples = d2->SampleDesc.Count > 1 ? d2->SampleDesc.Count : 1;
+        if (im->samples > 1)
+            im->mips = im->d2.MipLevels = 1;
     }
+    if (!im->samples)
+        im->samples = 1;
     if (!im->w) im->w = 1;
     if (!im->h) im->h = 1;
     if (!im->mips) {                    /* 0 = the full chain */
@@ -1583,10 +1593,10 @@ static Image *image_new(int is3d, const D3D11_TEXTURE2D_DESC *d2, const D3D11_TE
     ci.extent.depth = im->depth;
     ci.mipLevels = im->mips;
     ci.arrayLayers = im->layers;
-    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.samples = (VkSampleCountFlagBits)im->samples;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+    if (im->samples == 1 && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
         ci.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
     if ((bind & D3D11_BIND_RENDER_TARGET) &&
         (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
@@ -1687,10 +1697,26 @@ void vk11_tex2d_GetDesc(ID3D11Texture2D *t, D3D11_TEXTURE2D_DESC *d)
 HRESULT vk11_dev_CheckMultisampleQualityLevels(ID3D11Device *dev, DXGI_FORMAT f, UINT count,
                                                UINT *levels)
 {
-    /* Single-sampled only: the renderer then falls back to one sample. */
-    (void)dev; (void)f;
-    if (levels)
-        *levels = count == 1 ? 1 : 0;
+    /* What the device can render into at this count; render targets and
+     * depth buffers only (Image.samples). */
+    Fmt fi = fmt_info(f);
+    VkSampleCountFlags ok;
+
+    (void)dev;
+    if (!levels)
+        return E_INVALIDARG;
+    *levels = 0;
+    if (count == 1) {
+        *levels = 1;
+        return S_OK;
+    }
+    if (fi.vk == VK_FORMAT_UNDEFINED || count > 64 || (count & (count - 1)))
+        return S_OK;
+    ok = (fi.aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
+        ? G.props.limits.framebufferDepthSampleCounts & G.props.limits.framebufferStencilSampleCounts
+        : G.props.limits.framebufferColorSampleCounts;
+    if (ok & count)
+        *levels = 1;
     return S_OK;
 }
 
@@ -1745,6 +1771,8 @@ HRESULT vk11_dev_CreateShaderResourceView(ID3D11Device *dev, ID3D11Resource *res
     (void)dev;
     if (!im || im->o.kind != K_TEXTURE || !im->img || !out)
         return E_INVALIDARG;
+    if (im->samples > 1)
+        return E_INVALIDARG;            /* resolved first; never sampled as is */
     LOCK();
     mips = im->mips;
     layers = im->layers;
@@ -2769,7 +2797,7 @@ static VkPipeline build_pipeline(const PipeKey *k)
 
     memset(&ms, 0, sizeof ms);
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = (VkSampleCountFlagBits)(k->samples ? k->samples : 1);
     ms.alphaToCoverageEnable = k->blend.AlphaToCoverageEnable ? VK_TRUE : VK_FALSE;
 
     memset(&ds, 0, sizeof ds);
@@ -2886,6 +2914,14 @@ static VkPipeline current_pipeline(void)
     for (i = 0; i < S.pass_nrtv; i++)
         k.rt[i] = S.pass_rtv[i] ? S.pass_rtv[i]->fmt : VK_FORMAT_UNDEFINED;
     k.dsfmt = S.pass_dsv ? S.pass_dsv->fmt : VK_FORMAT_UNDEFINED;
+    k.samples = 1;
+    for (i = 0; i < S.pass_nrtv; i++)
+        if (S.pass_rtv[i]) {
+            k.samples = S.pass_rtv[i]->res->samples;
+            break;
+        }
+    if (i == S.pass_nrtv && S.pass_dsv)
+        k.samples = S.pass_dsv->res->samples;
 
     h = key_hash(&k);
     for (e = G.pipes[h % PIPE_BUCKETS]; e; e = e->next)
@@ -3672,10 +3708,11 @@ static void copy_region(Image *dst, UINT dsub, UINT dx, UINT dy, UINT dz,
         cp.dstSubresource.layerCount = 1;
         cp.dstOffset.x = (int32_t)dx; cp.dstOffset.y = (int32_t)dy; cp.dstOffset.z = (int32_t)dz;
         cp.extent.width = w; cp.extent.height = h; cp.extent.depth = d;
-        if (src->f.bpe == dst->f.bpe && src->f.block == dst->f.block)
+        if (src->f.bpe == dst->f.bpe && src->f.block == dst->f.block &&
+            src->samples == dst->samples)
             vkCmdCopyImage(G.cmd, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img,
                            VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-    } else if (src->img && dst->sbuf && dsub == 0) {
+    } else if (src->img && dst->sbuf && dsub == 0 && src->samples == 1) {
         VkBufferImageCopy cp;
         memset(&cp, 0, sizeof cp);
         cp.bufferOffset = (VkDeviceSize)dz * dst->sslice + (VkDeviceSize)(dy / dst->f.block) * dst->srow +
@@ -3777,10 +3814,41 @@ void vk11_ctx_CopyResource(ID3D11DeviceContext *c, ID3D11Resource *dst, ID3D11Re
 void vk11_ctx_ResolveSubresource(ID3D11DeviceContext *c, ID3D11Resource *dst, UINT dsub,
                                  ID3D11Resource *src, UINT ssub, DXGI_FORMAT f)
 {
-    /* Nothing here is multisampled (CheckMultisampleQualityLevels), so a
-     * resolve is a copy. */
+    Obj *d = (Obj *)dst, *s = (Obj *)src;
+    Image *di, *si;
+    uint32_t smip, slayer, dmip, dlayer;
+    VkImageResolve r;
+
     (void)f;
-    vk11_ctx_CopySubresourceRegion(c, dst, dsub, 0, 0, 0, src, ssub, NULL);
+    if (!d || !s || d->kind != K_TEXTURE || s->kind != K_TEXTURE)
+        return;
+    di = (Image *)d;
+    si = (Image *)s;
+    if (si->samples <= 1 || !si->img || !di->img || di->samples != 1) {
+        vk11_ctx_CopySubresourceRegion(c, dst, dsub, 0, 0, 0, src, ssub, NULL);
+        return;
+    }
+    LOCK();
+    sub_split(si, ssub, &smip, &slayer);
+    sub_split(di, dsub, &dmip, &dlayer);
+    memset(&r, 0, sizeof r);
+    r.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    r.srcSubresource.mipLevel = smip;
+    r.srcSubresource.baseArrayLayer = slayer;
+    r.srcSubresource.layerCount = 1;
+    r.dstSubresource = r.srcSubresource;
+    r.dstSubresource.mipLevel = dmip;
+    r.dstSubresource.baseArrayLayer = dlayer;
+    r.extent.width = mip_dim(si->w, smip) < mip_dim(di->w, dmip) ? mip_dim(si->w, smip)
+                                                                   : mip_dim(di->w, dmip);
+    r.extent.height = mip_dim(si->h, smip) < mip_dim(di->h, dmip) ? mip_dim(si->h, smip)
+                                                                    : mip_dim(di->h, dmip);
+    r.extent.depth = 1;
+    begin_transfer();
+    vkCmdResolveImage(G.cmd, si->img, VK_IMAGE_LAYOUT_GENERAL, di->img,
+                      VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    end_transfer();
+    UNLOCK();
 }
 
 /* ======================================================================

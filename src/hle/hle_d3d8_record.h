@@ -97,6 +97,11 @@ IDirect3DTexture8 *hle_d3d8_fb_kept(uint32_t phys);
 /* The host size of a frame-buffer texture the guest made w x h: scaled
  * like the scene, so supersampling survives a title sampling its frame. */
 void hle_d3d8_fb_host_size(UINT w, UINT h, UINT *host_w, UINT *host_h);
+/* The host size of an offscreen render target the guest made w x h:
+ * scaled like the scene (RECOMP_RT_SCALE=0 keeps the guest's size), no
+ * side past 8192. A caller that makes one bigger than w x h gives it the
+ * guest size with xbox_D3D8SetTextureTexelSize. */
+void hle_d3d8_rt_host_size(UINT w, UINT h, UINT *host_w, UINT *host_h);
 /* Counts draws and clears into a frame buffer; a copy of it taken at an
  * older count is out of date. */
 unsigned long hle_d3d8_fb_generation(void);
@@ -160,7 +165,8 @@ ULONG   host_ReleaseTexture(IDirect3DTexture8 *texture);
 HRESULT host_SetRenderTarget(IDirect3DDevice8 *dev, IDirect3DBaseTexture8 *texture,
                              UINT level, UINT face, IDirect3DSurface8 *depth);
 HRESULT host_CreateDepthStencilSurface(IDirect3DDevice8 *dev, UINT width, UINT height,
-                                       D3DFORMAT format, IDirect3DSurface8 **surface);
+                                       D3DFORMAT format, D3DMULTISAMPLE_TYPE multisample,
+                                       IDirect3DSurface8 **surface);
 /* The device's own depth surface, read once while it is still the one bound
  * (call right after creating the device). A capture names it with
  * D3D8CAP_DEPTH_DEVICE rather than as a depth surface of its own. Not a

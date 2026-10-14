@@ -59,6 +59,8 @@ static const char *const k_frame_caps[] = { "adaptive", "60", "30", "0", NULL };
 
 static RecompSettings g_settings;
 static int            g_frame_cap_index;   /* into k_frame_caps */
+static const char *const k_msaa[] = { "Off", "2x", "4x", "8x", NULL };
+static int            g_msaa_index;        /* into k_msaa: 1 << index samples */
 static int            g_wide_camera;       /* hor_plus as a switch, see below */
 
 static Row  g_video_rows[8];
@@ -130,6 +132,11 @@ static void build_rows(void)
     r->kind  = ROW_INT; r->lo = 1; r->hi = 16; r->ival = &g_settings.anisotropy;
     r++;
 
+    r->label = "Antialiasing";
+    r->help  = "Smooth the edges of 3D geometry (MSAA). Combines with Resolution.";
+    r->kind  = ROW_CHOICE; r->choices = k_msaa; r->ival = &g_msaa_index;
+    r++;
+
     r->label = "Frame rate";
     r->help  = "Adaptive paces the game the way the console did. F10 changes it"
                " while playing.";
@@ -162,7 +169,10 @@ static void row_value(const Row *r, char *out, size_t n)
             snprintf(out, n, "%dx", *r->ival);
         break;
     case ROW_CHOICE:
-        snprintf(out, n, "%s", frame_cap_label(*r->ival));
+        if (r->choices == k_msaa)
+            snprintf(out, n, "%s", k_msaa[*r->ival]);
+        else
+            snprintf(out, n, "%s", frame_cap_label(*r->ival));
         break;
     default:
         snprintf(out, n, "%s", r->text && r->text[0] ? r->text : "Beside the game");
@@ -419,6 +429,7 @@ static void settings_load(void)
         recomp_settings_read(path, &g_settings);
 
     g_wide_camera = g_settings.hor_plus > 0.01;
+    g_msaa_index = g_settings.msaa >= 8 ? 3 : g_settings.msaa >= 4 ? 2 : g_settings.msaa >= 2 ? 1 : 0;
     g_frame_cap_index = 0;
     {
         int i;
@@ -464,6 +475,7 @@ static int settings_save(void)
 #endif
     snprintf(g_settings.frame_cap, sizeof g_settings.frame_cap, "%s",
              k_frame_caps[g_frame_cap_index]);
+    g_settings.msaa = 1 << g_msaa_index;
 
     if (!recomp_settings_path(g_title_id, path, sizeof path))
         return 0;

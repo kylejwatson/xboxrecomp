@@ -293,7 +293,11 @@ static HRESULT copy_region(IDirect3DTexture8 *dst, int rect, int src_x, int src_
     ID3D11DeviceContext_VSSetShader(ctx, g.vs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(ctx, g.ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(ctx, 7, 1, &g.cb);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 9, 1, &g.back_srv);
+    /* Fetched per copy: a multisampled scene is resolved by the asking. */
+    {
+        ID3D11ShaderResourceView *scene = d3d8_GetSceneSRV();
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 9, 1, &scene);
+    }
     ID3D11DeviceContext_OMSetBlendState(ctx, g.blend, blend_factor, 0xFFFFFFFF);
     ID3D11DeviceContext_OMSetDepthStencilState(ctx, g.depth, 0);
     ID3D11DeviceContext_RSSetState(ctx, g.raster);

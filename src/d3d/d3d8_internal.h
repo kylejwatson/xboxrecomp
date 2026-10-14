@@ -163,9 +163,11 @@ typedef struct D3D8Texture {
     BOOL                    locked;
     BOOL                    dirty;
     UINT                    palette;    /* Palette index (texture stage) this P8 texture bakes */
-    /* The size a linear texture's texel coordinates are measured against,
-     * when the host texture is bigger than the guest's (a frame-buffer
-     * texture made at the scaled scene size); 0 means width/height. */
+    /* The guest's size for a host texture made bigger than the guest's (a
+     * frame-buffer texture at the scaled scene size, a render target scaled
+     * with the scene): what linear-format texel coordinates are measured
+     * against, and what the title's viewports on its levels are in.
+     * 0 means width/height. */
     UINT                    texel_width;
     UINT                    texel_height;
 } D3D8Texture;
@@ -178,6 +180,12 @@ typedef struct D3D8Surface {
     ID3D11DepthStencilView *dsv;
     UINT                    width;
     UINT                    height;
+    /* The size the title thinks this surface is, when the host made it
+     * bigger (a level of a texture with a texel size, see
+     * xbox_D3D8SetTextureTexelSize): the title's viewports, scissors and
+     * clear rectangles on it are in these units. 0 means width/height. */
+    UINT                    guest_width;
+    UINT                    guest_height;
     D3DFORMAT               format;
     D3DPOOL                 pool;
     DWORD                   usage;

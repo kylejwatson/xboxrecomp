@@ -66,6 +66,11 @@ typedef struct D3D8DeviceState {
     UINT                    swap_height;
     ID3D11Texture2D          *scene_texture;  /* NULL while unscaled */
     ID3D11ShaderResourceView *scene_srv;      /* the finished frame, to read */
+    /* Multisampled scene (RECOMP_MSAA): samples per pixel of scene_texture
+     * and the device depth, and the single-sampled copy everything that
+     * reads the scene reads (scene_srv views it). NULL at one sample. */
+    UINT                      scene_samples;
+    ID3D11Texture2D          *scene_resolved;
     ID3D11RenderTargetView   *present_rtv;    /* the back buffer; NULL unscaled */
     D3DFORMAT               backbuffer_format;
 
@@ -209,8 +214,46 @@ void xbox_D3D8GetSceneSize(UINT *width, UINT *height)
     if (height) *height = g_device_state.height;
 }
 
-ID3D11ShaderResourceView *d3d8_GetSceneSRV(void) { return g_device_state.scene_srv; }
-ID3D11Texture2D *d3d8_GetSceneTexture(void) { return g_device_state.scene_texture; }
+/* The multisampled scene, resolved into the copy that can be read. Every
+ * reader asks just before it reads, so each sees the scene as drawn up to
+ * that moment: the screen copies a title makes mid-frame (Future Perfect
+ * grades its world through one) as much as the present. */
+static void scene_resolve(void)
+{
+    D3D8DeviceState *s = &g_device_state;
+
+    if (s->scene_resolved && s->scene_texture)
+        ID3D11DeviceContext_ResolveSubresource(s->d3d11_context,
+                                               (ID3D11Resource *)s->scene_resolved, 0,
+                                               (ID3D11Resource *)s->scene_texture, 0,
+                                               DXGI_FORMAT_R8G8B8A8_UNORM);
+}
+
+ID3D11ShaderResourceView *d3d8_GetSceneSRV(void)
+{
+    scene_resolve();
+    return g_device_state.scene_srv;
+}
+
+ID3D11Texture2D *d3d8_GetSceneTexture(void)
+{
+    scene_resolve();
+    return g_device_state.scene_resolved ? g_device_state.scene_resolved
+                                         : g_device_state.scene_texture;
+}
+
+/* The scene's multisample type, for a depth surface that is to be bound
+ * with it: D3D11 and Vulkan want the two to agree. */
+D3DMULTISAMPLE_TYPE xbox_D3D8SceneMultisample(void)
+{
+    UINT n = g_device_state.scene_samples;
+
+    /* d3d8_msaa_sample_count reads x and y counts from the nibbles. */
+    if (n == 2) return (D3DMULTISAMPLE_TYPE)0x0021;
+    if (n == 4) return (D3DMULTISAMPLE_TYPE)0x0022;
+    if (n == 8) return (D3DMULTISAMPLE_TYPE)0x0042;
+    return D3DMULTISAMPLE_NONE;
+}
 /* The render target drawing goes to right now: a title's own surface, or the
  * scene target when none is set. For the screen copy's probe. */
 ID3D11RenderTargetView *d3d8_GetCurrentRTV(void)
@@ -222,20 +265,26 @@ ID3D11RenderTargetView *d3d8_GetCurrentRTV(void)
  * scissor rectangle -- the two pieces of state a title hands us measured
  * in pixels rather than normalised.
  *
- * Only the scene target is scaled today. A title's own offscreen target is
- * still created at the size it asked for, so anything bound there keeps a
- * factor of one; that is what lets render-target scaling be a later step
- * rather than a precondition. */
+ * The scene target is scaled by the display policy; a title's own
+ * offscreen target is scaled when the HLE made it bigger than the title
+ * asked (its surface then carries the guest size), and keeps a factor of
+ * one otherwise. */
 static float rt_scale_x(void)
 {
-    if (g_cur_rt || !g_device_state.present_width)
+    if (g_cur_rt)
+        return g_cur_rt->guest_width
+            ? (float)g_cur_rt->width / (float)g_cur_rt->guest_width : 1.0f;
+    if (!g_device_state.present_width)
         return 1.0f;
     return (float)g_device_state.width / (float)g_device_state.present_width;
 }
 
 static float rt_scale_y(void)
 {
-    if (g_cur_rt || !g_device_state.present_height)
+    if (g_cur_rt)
+        return g_cur_rt->guest_height
+            ? (float)g_cur_rt->height / (float)g_cur_rt->guest_height : 1.0f;
+    if (!g_device_state.present_height)
         return 1.0f;
     return (float)g_device_state.height / (float)g_device_state.present_height;
 }
@@ -300,7 +349,7 @@ static void present_resolve(void)
         d3d8_display_output_shape(s->width, s->height, &shape_w, &shape_h);
         fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
     }
-    d3d8_display_resolve(s->scene_srv, s->width, s->height, s->present_rtv, fit);
+    d3d8_display_resolve(d3d8_GetSceneSRV(), s->width, s->height, s->present_rtv, fit);
 }
 
 /* The scissor rectangle, from the Xbox's D3DDevice_SetScissors. The host
@@ -467,6 +516,29 @@ static HRESULT d3d11_create_device_and_swap_chain(
     return S_OK;
 }
 
+/* RECOMP_MSAA, or the most below it that the host renders both the scene's
+ * colour and its depth at. */
+static UINT scene_sample_count(ID3D11Device *dev)
+{
+    UINT want = d3d8_display_policy()->msaa, n;
+
+    for (n = want; n > 1; n >>= 1) {
+        UINT qc = 0, qd = 0;
+
+        if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(dev,
+                          DXGI_FORMAT_R8G8B8A8_UNORM, n, &qc)) && qc &&
+            SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(dev,
+                          DXGI_FORMAT_D24_UNORM_S8_UINT, n, &qd)) && qd)
+            break;
+    }
+    if (n < 1)
+        n = 1;
+    if (want > 1)
+        fprintf(stderr, "D3D8 display: scene multisampled %ux%s\n", n,
+                n < want ? " (the most the host offers below what was asked)" : "");
+    return n;
+}
+
 static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
 {
     ID3D11Texture2D *back_buffer = NULL;
@@ -492,15 +564,17 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
          *
          * SHADER_RESOURCE because both the resolve and a title reading
          * back its own screen sample it. */
+        state->scene_samples = scene_sample_count(state->d3d11_device);
         memset(&sd, 0, sizeof sd);
         sd.Width = state->width;
         sd.Height = state->height;
         sd.MipLevels = 1;
         sd.ArraySize = 1;
         sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        sd.SampleDesc.Count = 1;
+        sd.SampleDesc.Count = state->scene_samples;
         sd.Usage = D3D11_USAGE_DEFAULT;
-        sd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        sd.BindFlags = D3D11_BIND_RENDER_TARGET |
+                       (state->scene_samples > 1 ? 0 : D3D11_BIND_SHADER_RESOURCE);
 
         hr = ID3D11Device_CreateTexture2D(state->d3d11_device, &sd, NULL,
                                           &state->scene_texture);
@@ -508,9 +582,18 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
             hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
                                                       (ID3D11Resource *)state->scene_texture,
                                                       NULL, &state->default_rtv);
+        if (SUCCEEDED(hr) && state->scene_samples > 1) {
+            /* What the multisampled scene resolves into for reading. */
+            sd.SampleDesc.Count = 1;
+            sd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            hr = ID3D11Device_CreateTexture2D(state->d3d11_device, &sd, NULL,
+                                              &state->scene_resolved);
+        }
         if (SUCCEEDED(hr))
             hr = ID3D11Device_CreateShaderResourceView(state->d3d11_device,
-                                                        (ID3D11Resource *)state->scene_texture,
+                                                        (ID3D11Resource *)(state->scene_resolved
+                                                            ? state->scene_resolved
+                                                            : state->scene_texture),
                                                         NULL, &state->scene_srv);
         if (SUCCEEDED(hr))
             hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
@@ -531,7 +614,7 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
     depth_desc.MipLevels = 1;
     depth_desc.ArraySize = 1;
     depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    depth_desc.SampleDesc.Count = 1;
+    depth_desc.SampleDesc.Count = state->scene_samples ? state->scene_samples : 1;
     depth_desc.SampleDesc.Quality = 0;
     depth_desc.Usage = D3D11_USAGE_DEFAULT;
     depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
@@ -657,6 +740,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         if (s->default_rtv) { ID3D11RenderTargetView_Release(s->default_rtv); s->default_rtv = NULL; }
         if (s->scene_srv) { ID3D11ShaderResourceView_Release(s->scene_srv); s->scene_srv = NULL; }
         if (s->scene_texture) { ID3D11Texture2D_Release(s->scene_texture); s->scene_texture = NULL; }
+        if (s->scene_resolved) { ID3D11Texture2D_Release(s->scene_resolved); s->scene_resolved = NULL; }
         if (s->present_rtv) { ID3D11RenderTargetView_Release(s->present_rtv); s->present_rtv = NULL; }
         if (s->swap_chain) { IDXGISwapChain_Release(s->swap_chain); s->swap_chain = NULL; }
         if (s->d3d11_context) { ID3D11DeviceContext_Release(s->d3d11_context); s->d3d11_context = NULL; }
@@ -762,7 +846,9 @@ static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuff
      * to, and its size is the one the rest of the device reports. They are
      * the same object while unscaled. */
     if (g_device_state.scene_texture) {
-        back_buffer = g_device_state.scene_texture;
+        /* Resolved when multisampled: what the HLE locks for its frame
+         * dumps, which a multisampled texture cannot be copied for. */
+        back_buffer = d3d8_GetSceneTexture();
         ID3D11Texture2D_AddRef(back_buffer);
     } else {
         hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
@@ -1591,6 +1677,12 @@ static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSu
                 ds->width, ds->height,
                 rt ? rt->width : g_device_state.width,
                 rt ? rt->height : g_device_state.height);
+        return E_INVALIDARG;
+    }
+    if (ds && ds->sample_count != (rt ? rt->sample_count
+                                      : (g_device_state.scene_samples ? g_device_state.scene_samples : 1))) {
+        fprintf(stderr, "D3D8: SetRenderTarget with depth of %u samples for a target of %u\n",
+                ds->sample_count, rt ? rt->sample_count : g_device_state.scene_samples);
         return E_INVALIDARG;
     }
     if (rt) IDirect3DSurface8_AddRef(pRenderTarget);

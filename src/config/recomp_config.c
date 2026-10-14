@@ -180,6 +180,7 @@ void recomp_settings_defaults(RecompSettings *s)
     s->hor_plus          = 0.0;
     s->hor_plus_register = 60;
     s->anisotropy        = 1;
+    s->msaa              = 1;
     s->fps_overlay       = 0;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
 }
@@ -230,6 +231,11 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             s->hor_plus_register = clamp_int(atoi(v), 0, 191);
         if ((v = from_table("anisotropy")) != NULL)
             s->anisotropy = clamp_int(atoi(v), 1, 16);
+        if ((v = from_table("msaa")) != NULL) {
+            int m = atoi(v);
+
+            s->msaa = m >= 8 ? 8 : m >= 4 ? 4 : m >= 2 ? 2 : 1;
+        }
         if ((v = from_table("frame_cap")) != NULL)
             snprintf(s->frame_cap, sizeof s->frame_cap, "%s", v);
         if ((v = from_table("fps_overlay")) != NULL)
@@ -315,6 +321,11 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# is left alone, which wants no filtering.              [RECOMP_ANISO]\n"
         "anisotropy = %d\n"
         "\n"
+        "# Smooth the edges of 3D geometry: 1 (off), 2, 4 or 8 samples per\n"
+        "# pixel. Combines with resolution_scale, which smooths everything\n"
+        "# (textures and cut-outs too) at a higher cost.        [RECOMP_MSAA]\n"
+        "msaa = %d\n"
+        "\n"
         "# Frame pacing: adaptive, 60, 30, or 0 for uncapped.  [RECOMP_FPS_CAP]\n"
         "frame_cap = %s\n"
         "\n"
@@ -325,7 +336,7 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# Where the game's files are, if they are not beside the executable.\n"
         "#                                                   [RECOMP_GAME_DIR]\n",
         s->resolution_scale, s->widescreen, s->hor_plus, s->hor_plus_register,
-        s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay);
+        s->anisotropy, s->msaa, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay);
 
     if (s->game_dir[0])
         fprintf(f, "game_dir = %s\n", s->game_dir);

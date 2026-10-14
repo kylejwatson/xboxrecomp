@@ -945,6 +945,7 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
     texture_layout t;
     texture_entry *e = NULL;
     uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
+    UINT host_w, host_h;
     int i;
 
     for (i = 0; i < g_texture_count; i++) {
@@ -978,13 +979,18 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
         host_ReleaseTexture(e->host);
         memset(e, 0, sizeof *e);
     }
-    if (FAILED(host_CreateTexture(dev, t.width, t.height, t.levels, D3DUSAGE_RENDERTARGET,
+    /* Scaled with the scene (hle_d3d8_rt_host_size), the guest size kept
+     * for its texel coordinates and the title's viewports on it. */
+    hle_d3d8_rt_host_size(t.width, t.height, &host_w, &host_h);
+    if (FAILED(host_CreateTexture(dev, host_w, host_h, t.levels, D3DUSAGE_RENDERTARGET,
                                   (D3DFORMAT)t.fmt, D3DPOOL_DEFAULT, &e->host)) ||
         !e->host) {
         memset(e, 0, sizeof *e);
         g_skip_create++;
         return NULL;
     }
+    if (host_w != t.width || host_h != t.height)
+        xbox_D3D8SetTextureTexelSize(e->host, t.width, t.height);
     e->va = va;
     e->data = data;
     e->format = format;
@@ -992,7 +998,8 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
     e->rendered = 1;
     e->checked_swap = e->used_swap = now;
     fprintf(stderr, "[HLE-D3D8] shadow render target texture 0x%08X: format 0x%02X "
-            "%ux%u, %u level(s)\n", va, t.fmt, t.width, t.height, t.levels);
+            "%ux%u, %u level(s), host %ux%u\n", va, t.fmt, t.width, t.height, t.levels,
+            host_w, host_h);
     return e->host;
 }
 

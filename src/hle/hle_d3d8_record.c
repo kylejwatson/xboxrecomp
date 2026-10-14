@@ -1322,10 +1322,11 @@ IDirect3DSurface8 *host_DeviceDepthSurface(IDirect3DDevice8 *dev)
 }
 
 HRESULT host_CreateDepthStencilSurface(IDirect3DDevice8 *dev, UINT width, UINT height,
-                                       D3DFORMAT format, IDirect3DSurface8 **surface)
+                                       D3DFORMAT format, D3DMULTISAMPLE_TYPE multisample,
+                                       IDirect3DSurface8 **surface)
 {
     return dev->lpVtbl->CreateDepthStencilSurface(dev, width, height, format,
-                                                  D3DMULTISAMPLE_NONE, surface);
+                                                  multisample, surface);
 }
 
 /* -------------------------------------------- vertex programs, combiners */

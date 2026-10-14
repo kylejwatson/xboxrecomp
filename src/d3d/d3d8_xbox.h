@@ -1174,14 +1174,19 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height);
 /* The size the host actually renders the screen at: the guest size scaled
  * by the display policy (RECOMP_RES_SCALE, RECOMP_WIDESCREEN). */
 void xbox_D3D8GetSceneSize(UINT *width, UINT *height);
+/* The scene target's multisample type (RECOMP_MSAA), for a depth surface
+ * to be bound with it; D3DMULTISAMPLE_NONE when it has one sample. */
+D3DMULTISAMPLE_TYPE xbox_D3D8SceneMultisample(void);
 /* The size to open the window at for a guest presenting at guest_w x
  * guest_h: the guest's own when nothing is scaled, else 720 lines at the
  * output's shape (1280x720 in widescreen). The window can be resized or
  * made fullscreen afterwards; the picture is fitted to it at present. */
 void xbox_D3D8WindowSize(UINT guest_w, UINT guest_h, UINT *width, UINT *height);
 /* For a texture made bigger than the guest's (one standing for the screen,
- * made at the scene size): the guest size, which linear-format texel
- * coordinates are measured against. */
+ * made at the scene size, or a render target scaled with it): the guest
+ * size, which linear-format texel coordinates are measured against and
+ * which the title's viewports, scissors and clear rectangles on its levels
+ * are measured in. */
 void xbox_D3D8SetTextureTexelSize(IDirect3DTexture8 *texture, UINT width, UINT height);
 
 /* The Xbox's D3DDevice_SetScissors: clip drawing to the rectangles (or, with

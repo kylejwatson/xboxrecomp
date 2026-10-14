@@ -1479,6 +1479,13 @@ static HRESULT __stdcall tex_GetSurfaceLevel(IDirect3DTexture8 *self, UINT Level
                                          ? tex->sys_mem + tex_level_offset(tex, Level)
                                          : NULL,
                                      tex->palette);
+    if (*ppSurface && tex->texel_width && tex->texel_height) {
+        D3D8Surface *sf = (D3D8Surface *)*ppSurface;
+        UINT gw = tex->texel_width >> Level, gh = tex->texel_height >> Level;
+
+        sf->guest_width = gw ? gw : 1;
+        sf->guest_height = gh ? gh : 1;
+    }
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
