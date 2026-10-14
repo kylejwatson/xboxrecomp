@@ -499,6 +499,7 @@ int hle_d3d8_is_framebuffer(uint32_t phys)
  * frame for a title that uses both buffers, none for one that does not. */
 #if HLE_HOST_RENDERER
 static uint32_t g_target_fb;            /* frame buffer being drawn into, 0 offscreen */
+static IDirect3DTexture8 *g_target_texture; /* the title's texture being drawn into, or NULL */
 static uint32_t g_host_holds;           /* frame buffer the host back buffer holds */
 static struct { uint32_t phys; IDirect3DTexture8 *tex; int valid; } g_fb_kept[4];
 static unsigned long g_fb_gen;
@@ -822,8 +823,12 @@ uint32_t hle_d3d8_shadow_program_object(void);
 void hle_d3d8_push_sync(void);
 void hle_d3d8_push_check_declaration(uint32_t object);
 static void shadow_sync_program(void);
+/* hle_d3d8_texture.c: a stage bound to the texture being drawn into samples
+ * a copy of it taken now. */
+void hle_d3d8_texture_feedback(IDirect3DTexture8 *target);
 static void shadow_sync_push(void)
 {
+    hle_d3d8_texture_feedback(g_target_texture);
     hle_d3d8_push_sync();
     shadow_sync_program();
     hle_d3d8_push_check_declaration(hle_d3d8_shadow_program_object());
@@ -3399,6 +3404,7 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     }
     g_target_width = w;
     g_target_height = h;
+    g_target_texture = kind == 1 ? texture : NULL;
     if (kind != 0)
         g_target_fb = 0;
     else if (rt)
@@ -3782,6 +3788,22 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
     return out;
 }
 
+/* A draw in the swap trace, with its first vertices' dwords as floats. */
+static void shadow_trace_draw(const char *what, uint32_t xpt, uint32_t count,
+                              const void *verts, uint32_t vertices, uint32_t stride)
+{
+    const float *f = (const float *)verts;
+    uint32_t k, n = (vertices < 4 ? vertices : 4) * (stride / 4);
+
+    if (!shadow_trace_on())
+        return;
+    fprintf(stderr, "[TRACE swap %lu] %s xpt %u count %u stride %u:", g_shadow_swaps, what,
+            xpt, count, stride);
+    for (k = 0; k < n && k < 40; k++)
+        fprintf(stderr, " %g", f[k]);
+    fprintf(stderr, "\n");
+}
+
 /* The host half of every non-indexed draw: the UP draw below and the vertex
  * buffer draws in hle_d3d8_vertex.c. `verts` is already a host pointer to the
  * first vertex; from_buffer only picks the counter the draw lands in. */
@@ -3797,6 +3819,7 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
     if (!g_shadow || !verts || !stride || !count)
         return;
     shadow_sync_push();
+    shadow_trace_draw("Draw", xpt, count, verts, count, stride);
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
@@ -3878,6 +3901,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         vertices = hi - lo + 1;
         verts = (const uint8_t *)verts + (size_t)lo * stride;
     }
+    shadow_trace_draw("DrawIndexed", xpt, count, verts, vertices, stride);
 
     switch (xpt) {
     case XPT_TRIANGLEFAN:

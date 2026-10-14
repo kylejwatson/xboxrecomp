@@ -95,6 +95,9 @@ static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
 static texture_entry *g_bound_entry[MAX_STAGES];
+/* The stage holds a copy of the render target it is bound to, not the
+ * target itself; see hle_d3d8_texture_feedback. */
+static int g_bound_copy[MAX_STAGES];
 
 /* Each stage's palette: where the guest keeps it (physical, 0 for none) and
  * the checksum of what the host stage palette holds (0: not known). */
@@ -719,6 +722,7 @@ static void sync_palette(IDirect3DDevice8 *dev, uint32_t stage)
     host_stage_palette(dev, stage, sum);
     host_SetTexture(dev, stage, (IDirect3DBaseTexture8 *)v->host);
     g_bound[stage] = v->host;
+    g_bound_copy[stage] = 0;
     g_bound_entry[stage] = v;
 }
 
@@ -974,6 +978,7 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
         for (s = 0; s < MAX_STAGES; s++)
             if (g_bound[s] == e->host) {
                 g_bound[s] = NULL;
+                g_bound_copy[s] = 0;
                 host_SetTexture(dev, (DWORD)s, (IDirect3DBaseTexture8 *)white_texture(dev));
             }
         host_ReleaseTexture(e->host);
@@ -1001,6 +1006,102 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
             "%ux%u, %u level(s), host %ux%u\n", va, t.fmt, t.width, t.height, t.levels,
             host_w, host_h);
     return e->host;
+}
+
+/* A draw that samples the texture it renders into. Future Perfect's
+ * teleport shimmer (mission 3's opening, a soldier arriving) renders a
+ * 320x240 target and then draws 64 strips into it from itself, each shifted
+ * a few pixels sideways: a smear that relies on the NV2A reading memory the
+ * draw has mostly not overwritten yet. The host has no such read: D3D11
+ * unbinds a texture that is the render target (it samples black), and on
+ * Vulkan sampling the attachment being written is undefined -- with targets
+ * scaled to 1080 lines and up it came back as magenta and green blocks.
+ * Before each draw, a stage bound to the current target gets a copy of it as
+ * it is now, which is what the console reads for every texel the draw has
+ * not reached yet; the stage gets the target back once the draw that
+ * renders into it is over. RECOMP_HLE_D3D8_FEEDBACK_COPY=0 turns it off. */
+#define FEEDBACK_COPIES 4
+static struct { UINT w, h, levels, guest_w, guest_h; uint32_t fmt;
+                IDirect3DTexture8 *tex; } g_feedback[FEEDBACK_COPIES];
+static unsigned long g_feedback_copies;
+
+static IDirect3DTexture8 *feedback_copy(IDirect3DDevice8 *dev, IDirect3DTexture8 *target)
+{
+    D3DSURFACE_DESC d;
+    texture_layout t;
+    uint32_t va = 0;
+    int i, free_slot = -1;
+
+    for (i = 0; i < g_texture_count && !va; i++)
+        if (g_textures[i].host == target && g_textures[i].rendered)
+            va = g_textures[i].va;
+    if (!va || !read_layout(va, &t) ||
+        FAILED(target->lpVtbl->GetLevelDesc(target, 0, &d)))
+        return NULL;
+    for (i = 0; i < FEEDBACK_COPIES; i++) {
+        if (!g_feedback[i].tex) {
+            if (free_slot < 0)
+                free_slot = i;
+            continue;
+        }
+        if (g_feedback[i].w == d.Width && g_feedback[i].h == d.Height &&
+            g_feedback[i].levels == t.levels && g_feedback[i].fmt == t.fmt &&
+            g_feedback[i].guest_w == t.width && g_feedback[i].guest_h == t.height)
+            return g_feedback[i].tex;
+    }
+    if (free_slot < 0)
+        return NULL;
+    if (FAILED(host_CreateTexture(dev, d.Width, d.Height, t.levels, D3DUSAGE_RENDERTARGET,
+                                  (D3DFORMAT)t.fmt, D3DPOOL_DEFAULT,
+                                  &g_feedback[free_slot].tex)) || !g_feedback[free_slot].tex) {
+        g_feedback[free_slot].tex = NULL;
+        return NULL;
+    }
+    if (d.Width != t.width || d.Height != t.height)
+        xbox_D3D8SetTextureTexelSize(g_feedback[free_slot].tex, t.width, t.height);
+    g_feedback[free_slot].w = d.Width;
+    g_feedback[free_slot].h = d.Height;
+    g_feedback[free_slot].levels = t.levels;
+    g_feedback[free_slot].fmt = t.fmt;
+    g_feedback[free_slot].guest_w = t.width;
+    g_feedback[free_slot].guest_h = t.height;
+    fprintf(stderr, "[HLE-D3D8] a draw samples its own render target 0x%08X (%ux%u, host "
+            "%ux%u); it reads a copy taken before the draw\n",
+            va, t.width, t.height, d.Width, d.Height);
+    return g_feedback[free_slot].tex;
+}
+
+void hle_d3d8_texture_feedback(IDirect3DTexture8 *target)
+{
+    static int on = -1;
+    IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
+    IDirect3DTexture8 *copy = NULL;
+    int s, copied = 0;
+
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_FEEDBACK_COPY", 1);
+    if (!dev)
+        return;
+    for (s = 0; s < MAX_STAGES; s++) {
+        if (on && target && g_bound[s] == target) {
+            if (!copied) {
+                copied = 1;
+                copy = feedback_copy(dev, target);
+                if (copy && FAILED(xbox_D3D8CopyTexture(copy, target)))
+                    copy = NULL;
+                if (copy)
+                    g_feedback_copies++;
+            }
+            if (copy) {
+                host_SetTexture(dev, (DWORD)s, (IDirect3DBaseTexture8 *)copy);
+                g_bound_copy[s] = 1;
+            }
+        } else if (g_bound_copy[s]) {
+            host_SetTexture(dev, (DWORD)s, (IDirect3DBaseTexture8 *)
+                            (g_bound[s] ? g_bound[s] : white_texture(dev)));
+            g_bound_copy[s] = 0;
+        }
+    }
 }
 
 /* 1x1 opaque white, created once, never evicted. */
@@ -1045,6 +1146,9 @@ static void report(void)
             fprintf(stderr, "[HLE-D3D8] shadow textures: %lu changed after the frame "
                     "drew with them, in %lu frames\n", g_changed_after_draw,
                     g_frames_changed_after_draw);
+        if (g_feedback_copies)
+            fprintf(stderr, "[HLE-D3D8] shadow textures: %lu draws sampled their own "
+                    "render target through a copy\n", g_feedback_copies);
         if (g_midframe_changes)
             fprintf(stderr, "[HLE-D3D8] shadow textures: %lu changed mid-frame "
                     "(RECOMP_HLE_D3D8_TEX_EVERY_BIND)\n", g_midframe_changes);
@@ -1111,6 +1215,7 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
 
         if (!dev || stage >= MAX_STAGES)
             return;
+        g_bound_copy[stage] = 0;
         if (texture) {
             /* A cube the title rendered into is bound as itself; every other
              * cube is one this file does not mirror, and falls through to the
