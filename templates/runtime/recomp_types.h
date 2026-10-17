@@ -92,6 +92,17 @@ void recomp_cxx_throw(uint32_t object_va, uint32_t throwinfo_va);
 #define __debugbreak() __builtin_trap()
 #endif
 
+/* Runtime data the game module reads. A Windows DLL reaches data in the
+ * executable only through __declspec(dllimport) (RECOMP_MODULE_DLL is set
+ * for the module's sources); everywhere else this is nothing. */
+#ifndef RECOMP_RUNTIME_DATA
+#  if defined(_WIN32) && defined(RECOMP_MODULE_DLL)
+#    define RECOMP_RUNTIME_DATA __declspec(dllimport)
+#  else
+#    define RECOMP_RUNTIME_DATA
+#  endif
+#endif
+
 /* ================================================================
  * Memory offset
  * ================================================================ */
@@ -104,7 +115,7 @@ void recomp_cxx_throw(uint32_t object_va, uint32_t throwinfo_va);
  *
  * Set once during memory initialization, then read-only.
  */
-extern ptrdiff_t g_xbox_mem_offset;
+extern RECOMP_RUNTIME_DATA ptrdiff_t g_xbox_mem_offset;
 
 /* Bounds of the title's executable sections, filled in by
  * xbox_MemoryLayoutInit from the XBE's own section table. Zero means "not
@@ -115,10 +126,10 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* --force-return: read once at startup, so the check at each forced ret is a
  * load rather than a getenv. Zero unless RECOMP_FORCE_RETURN is set, which is
  * what lets a build carrying forced functions behave normally by default. */
-extern int g_force_return;
+extern RECOMP_RUNTIME_DATA int g_force_return;
 
-extern uint32_t g_xbox_code_lo;
-extern uint32_t g_xbox_code_hi;
+extern RECOMP_RUNTIME_DATA uint32_t g_xbox_code_lo;
+extern RECOMP_RUNTIME_DATA uint32_t g_xbox_code_hi;
 
 /* Is this indirect-call target plausibly code?
  *
@@ -397,13 +408,13 @@ static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits)
 #define ICALL_TRACE_SIZE 16
 
 /** Ring buffer of recent indirect call target VAs. */
-extern volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE];
+extern RECOMP_RUNTIME_DATA volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE];
 
 /** Current write index into the ring buffer. */
-extern volatile uint32_t g_icall_trace_idx;
+extern RECOMP_RUNTIME_DATA volatile uint32_t g_icall_trace_idx;
 
 /** Total count of indirect calls executed. */
-extern volatile uint64_t g_icall_count;
+extern RECOMP_RUNTIME_DATA volatile uint64_t g_icall_count;
 
 /**
  * Called when an indirect call target cannot be resolved.
@@ -1022,8 +1033,8 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * never wrong. Under RECOMP_ICALL_FEEDBACK the arms are counted, so a run
  * can say how often the guards held; otherwise they cost nothing. */
 #ifdef RECOMP_ICALL_FEEDBACK
-extern volatile uint64_t g_icall_guard_hits;
-extern volatile uint64_t g_icall_guard_misses;
+extern RECOMP_RUNTIME_DATA volatile uint64_t g_icall_guard_hits;
+extern RECOMP_RUNTIME_DATA volatile uint64_t g_icall_guard_misses;
 #define RECOMP_ICALL_GUARD_HIT()  ((void)g_icall_guard_hits++)
 #define RECOMP_ICALL_GUARD_MISS() ((void)g_icall_guard_misses++)
 #else

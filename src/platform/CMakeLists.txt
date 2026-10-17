@@ -21,8 +21,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
 if(WIN32)
-    add_library(platform INTERFACE)
-    target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
+    # setup_win32.c: the first-run window of a shared build (recomp_setup.h),
+    # with the system's controls and file dialog.
+    add_library(platform STATIC setup_win32.c)
+    target_include_directories(platform PUBLIC ${XBOXRECOMP_SRC_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(platform PUBLIC comctl32 ole32 shell32 uuid)
 else()
     # host_sdl.c: the game window, keyboard and gamepads (one SDL thread), and
     # the Win32 calls the shared code reads them through.

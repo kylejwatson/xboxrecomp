@@ -216,15 +216,18 @@ def find_compiler(kit_dir, requested):
 
 def compile_flags(kit, kit_dir, gen_dir):
     c = kit["compile"]
-    flags = [f"-std={c['std']}", "-O3", "-DNDEBUG", "-fPIC", "-w", "-g0",
+    flags = [f"-std={c['std']}", "-O3", "-DNDEBUG", "-w", "-g0",
              # The lifted code is x86 arithmetic written in C: signed
              # overflow wraps, and memory is read through any pointer type.
-             "-fwrapv", "-fno-strict-aliasing",
-             # The guest registers are thread-locals of the executable; their
-             # offsets are fixed, so no __tls_get_addr per access.
-             "-ftls-model=initial-exec",
-             # Calls inside the module are direct, not through the PLT.
-             "-fno-semantic-interposition"]
+             "-fwrapv", "-fno-strict-aliasing"]
+    if sys.platform != "win32":
+        flags += ["-fPIC",
+                  # The guest registers are thread-locals of the executable
+                  # (or the module); their offsets are fixed, so no
+                  # __tls_get_addr per access.
+                  "-ftls-model=initial-exec",
+                  # Calls inside the module are direct, not through the PLT.
+                  "-fno-semantic-interposition"]
     flags += ["-D" + d for d in c["defines"]]
     flags += ["-I" + str(kit_dir / d) for d in c["include_dirs"]]
     flags.append("-I" + str(gen_dir))
@@ -246,6 +249,53 @@ def compile_one(cc, flags, src, obj):
         return src, (r.stderr or r.stdout)[-3000:], True
     stamp.write_text(digest)
     return src, None, True
+
+
+def coff_defined_symbols(path):
+    """[(name, is_function)] for the external symbols a COFF object defines
+    (standard or /bigobj header): what a Windows module's .def exports."""
+    data = Path(path).read_bytes()
+    sig2, sig3 = struct.unpack_from("<HH", data, 0)
+    if sig2 == 0 and sig3 == 0xFFFF:            # ANON_OBJECT_HEADER_BIGOBJ
+        sym_ptr, nsyms = struct.unpack_from("<II", data, 44)
+        size, sec_fmt = 20, "<i"
+    else:
+        sym_ptr, nsyms = struct.unpack_from("<II", data, 8)
+        size, sec_fmt = 18, "<h"
+    strtab = sym_ptr + nsyms * size
+    out = []
+    i = 0
+    while i < nsyms:
+        e = sym_ptr + i * size
+        raw = data[e:e + 8]
+        section, = struct.unpack_from(sec_fmt, data, e + 12)
+        typ, storage, naux = struct.unpack_from("<HBB", data, e + size - 4)
+        if storage == 2 and section > 0:        # IMAGE_SYM_CLASS_EXTERNAL, defined
+            if raw[:4] == b"\0\0\0\0":
+                off = strtab + struct.unpack_from("<I", raw, 4)[0]
+                name = data[off:data.index(b"\0", off)]
+            else:
+                name = raw.rstrip(b"\0")
+            name = name.decode("ascii", "replace")
+            if not name.startswith((".", "__imp_")):
+                out.append((name, (typ >> 4) == 2))   # IMAGE_SYM_DTYPE_FUNCTION
+        i += 1 + naux
+    return out
+
+
+def write_module_def(objs, path):
+    """Every symbol the module's objects define, as a .def. MinGW exports
+    them all by itself only while no .def or dllexport says otherwise, and
+    even then leaves out names the executable's import library has too
+    (recomp_lookup, which both define), so the list is written out."""
+    seen = {}
+    for o in objs:
+        for name, is_func in coff_defined_symbols(o):
+            seen.setdefault(name, is_func)
+    lines = ["EXPORTS"] + [f"  {n}" + ("" if f else " DATA")
+                           for n, f in sorted(seen.items())]
+    Path(path).write_text("\n".join(lines) + "\n")
+    return len(seen)
 
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -434,6 +484,16 @@ def main():
         # executable too); its imports from the executable stay undefined
         # until it is loaded.
         link += ["-Wl,-Bsymbolic", "-lm"]
+    else:
+        # A DLL binds its own calls internally. Its imports come from the
+        # executable's import library (the kit's lib/). Every symbol is
+        # exported (write_module_def), since the runtime looks the entry
+        # points and HLE slots up by name, and the fault handler names
+        # functions from the exports.
+        def_file = work / (kit["module_name"] + ".def")
+        write_module_def(objs, def_file)
+        link += [str(def_file)]
+        link += [str(kit_dir / lib) for lib in kit.get("link", [])]
     r = subprocess.run(link, capture_output=True, text=True)
     if r.returncode != 0:
         sys.stderr.write((r.stderr or r.stdout)[-3000:] + "\n")

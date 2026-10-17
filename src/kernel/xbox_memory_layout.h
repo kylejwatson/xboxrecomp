@@ -25,6 +25,17 @@
 #include "platform/xbox_winnt.h"
 #include <stdint.h>
 
+/* Runtime data the game module reads. A Windows DLL reaches data in the
+ * executable only through __declspec(dllimport) (RECOMP_MODULE_DLL is set
+ * for the module's sources); everywhere else this is nothing. */
+#ifndef RECOMP_RUNTIME_DATA
+#  if defined(_WIN32) && defined(RECOMP_MODULE_DLL)
+#    define RECOMP_RUNTIME_DATA __declspec(dllimport)
+#  else
+#    define RECOMP_RUNTIME_DATA
+#  endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -51,7 +62,7 @@ extern "C" {
 /* Actual mapped RAM for this run. Defaults to XBOX_TOTAL_RAM; a title with a
  * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top and
  * mirror stride derive from this, not from the compile-time constant. */
-extern size_t g_xbox_total_ram;
+extern RECOMP_RUNTIME_DATA size_t g_xbox_total_ram;
 
 /* How much guest address space to map, when that must exceed RAM.
  *
@@ -75,7 +86,7 @@ extern size_t g_xbox_total_ram;
  *
  * Zero means "same as RAM", which is the existing behaviour for every title
  * that does not ask. Set before xbox_MemoryLayoutInit(). */
-extern size_t g_xbox_map_size;
+extern RECOMP_RUNTIME_DATA size_t g_xbox_map_size;
 void xbox_SetMapSize(size_t bytes);
 
 /* Carve a pure address-space reservation from the mapped range above RAM.
@@ -94,11 +105,11 @@ uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align);
 /* Full extent of the loaded XBE image -- every section, not just the
  * executable ones. Anything writing guest memory on the title's behalf must
  * stay out of this range. */
-extern uint32_t g_xbox_image_lo;
-extern uint32_t g_xbox_image_hi;
+extern RECOMP_RUNTIME_DATA uint32_t g_xbox_image_lo;
+extern RECOMP_RUNTIME_DATA uint32_t g_xbox_image_hi;
 
-extern uint32_t g_xbox_code_lo;
-extern uint32_t g_xbox_code_hi;
+extern RECOMP_RUNTIME_DATA uint32_t g_xbox_code_lo;
+extern RECOMP_RUNTIME_DATA uint32_t g_xbox_code_hi;
 void xbox_SetTotalRam(size_t bytes);
 
 /* NOTE: Section addresses (.text, .rdata, .data, etc.) are NOT hardcoded.
@@ -497,7 +508,7 @@ extern RECOMP_TLS RecompGuestRegs g_regs;
  * title that worked before, so nothing about them changes. Set once by
  * xbox_MemoryLayoutInit from the XBE header, before anything below is used. */
 #define XBOX_LOW_REGION_START  0x00700000u
-extern uint32_t g_xbox_low_shift;
+extern RECOMP_RUNTIME_DATA uint32_t g_xbox_low_shift;
 #define XBOX_LOW_VA(va)     ((uint32_t)(va) + g_xbox_low_shift)
 
 /** Base VA of the stack area (above last XBE section). */

@@ -19,7 +19,8 @@
 
 #if defined(_WIN32)
 #  include <windows.h>
-#  define MODULE_OPEN(p)      ((void *)LoadLibraryA(p))
+#  include <dbghelp.h>
+#  define MODULE_OPEN(p)      module_open_win32(p)
 #  define MODULE_SYM(h, s)    ((void *)GetProcAddress((HMODULE)(h), (s)))
 #  define PATH_SEP_CHAR       '\\'
 #else
@@ -37,6 +38,20 @@ typedef void (*recomp_func_t)(void);
 static RecompModuleSlot *g_slots;
 static void *g_module;
 static char g_module_path[1024];
+
+#if defined(_WIN32)
+/* A UTF-8 path (the module cache is under the player's profile, which may
+ * not be ASCII); its dependencies are looked for beside it first. The
+ * runtime it imports is this executable, already loaded under its own name
+ * (futureperfect_recomp.exe: a renamed executable cannot load the module). */
+static void *module_open_win32(const char *path)
+{
+    wchar_t wpath[1024];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024))
+        return NULL;
+    return (void *)LoadLibraryExW(wpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
+#endif
 
 static void (*g_entry)(void);
 static int (*g_dispatch_init)(void);
@@ -186,6 +201,11 @@ int recomp_module_load(const char *path, const char *default_name,
         if (p) filled++; else missing++;
     }
 
+#if defined(_WIN32)
+    /* The fault handler names a host address with SymFromAddr; the symbol
+     * handler was started before this module was loaded. */
+    SymRefreshModuleList(GetCurrentProcess());
+#endif
     fprintf(stderr, "[MODULE] %s: ABI %u, %d HLE imports filled, %d absent\n",
             g_module_path, (unsigned)*abi, filled, missing);
     return 1;

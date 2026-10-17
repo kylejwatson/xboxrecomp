@@ -75,6 +75,9 @@ KIT_FORMAT = 1
 # targets' INTERFACE_INCLUDE_DIRECTORIES, see the title's CMakeLists.txt).
 TOOLKIT_INCLUDES = ["include", "src", "src/input", "src/kernel", "src/config",
                     "src/platform", "src/platform/posix_include"]
+if sys.platform == "win32":
+    # The real <windows.h>: the POSIX stand-ins are for the other hosts.
+    TOOLKIT_INCLUDES.remove("src/platform/posix_include")
 # Compiled into every module: the ABI it was built for.
 MODULE_SOURCES = ["src/kernel/recomp_module_abi.c"]
 # The lifter's own packages; tests and caches are left out.
@@ -138,7 +141,8 @@ def header_closure(cc, sources, include_dirs, defines, generated_missing=False):
     """Every header outside the system ones the sources include, by path.
     generated_missing: the generated headers are not there (no lift); they
     are left out, and they include nothing that is not generated."""
-    argv = [cc, "-MM", "-std=gnu11", "-w"] + (["-MG"] if generated_missing else [])
+    # cc may be a command with arguments ("zig cc -target ...").
+    argv = cc.split() + ["-MM", "-std=gnu11", "-w"] + (["-MG"] if generated_missing else [])
     argv += ["-D" + d for d in defines]
     argv += ["-I" + str(d) for d in include_dirs]
     found = set()
@@ -147,7 +151,8 @@ def header_closure(cc, sources, include_dirs, defines, generated_missing=False):
         if out.returncode != 0:
             raise SystemExit(f"{cc} -MM failed on {src}:\n{out.stderr}")
         for tok in out.stdout.replace("\\\n", " ").split()[1:]:
-            if tok.endswith(".h") and (not generated_missing or "/" in tok
+            if tok.endswith(".h") and (not generated_missing or
+                                       ("/" in tok or "\\" in tok)
                                        and Path(tok).exists()):
                 found.add(Path(tok).resolve())
     return found
@@ -176,6 +181,9 @@ def main():
     ap.add_argument("--zig", help="A Zig distribution directory to include")
     ap.add_argument("--python", help="A fetch_python.py directory (holding python/) "
                                      "to include")
+    ap.add_argument("--link-lib", action="append", default=[],
+                    help="A library the module links (Windows: the runtime "
+                         "executable's import library), copied into kit/lib")
     ap.add_argument("--define", action="append", default=[],
                     help="A preprocessor define the module is built with, as "
                          "the title's build has it (e.g. RECOMP_REGS_IN_MODULE)")
@@ -313,6 +321,14 @@ def main():
                         symlinks=True,
                         ignore=shutil.ignore_patterns("__pycache__"))
 
+    # Libraries the module links: on Windows the executable's import library,
+    # through which the module reaches the runtime (Linux resolves those
+    # imports against the executable at load).
+    link = []
+    for lib in args.link_lib:
+        copy(Path(lib), out / "lib" / Path(lib).name)
+        link.append(f"lib/{Path(lib).name}")
+
     kit = {
         "format": KIT_FORMAT,
         "title_id": title_id,
@@ -333,6 +349,7 @@ def main():
             "sources": ["title/src/recomp_manual.c"]
                        + [f"toolkit/{s}" for s in MODULE_SOURCES],
         },
+        **({"link": link} if link else {}),
         "reference": {"digest": digest, "files": len(manifest)},
         "made_from": {"toolkit": git_describe(REPO), "title": git_describe(project),
                       "python": sys.version.split()[0],

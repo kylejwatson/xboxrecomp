@@ -65,9 +65,8 @@ endif()
 # the executable by default, its proven arrangement. The title's module and
 # executable need RECOMP_REGS_IN_MODULE as well (see its CMakeLists).
 #
-# Not on Windows yet: the register block is ready for it, but the module
-# build itself (the title's module target, the executable's import library,
-# the first-run window) has not been ported.
+# On Windows the module is a DLL that imports the runtime from the
+# executable (its import library) and owns the register block.
 option(XBOXRECOMP_GAME_MODULE "Load the lifted game as a shared module" OFF)
 if(WIN32)
     set(_regs_in_module_default ON)
@@ -77,8 +76,9 @@ endif()
 option(XBOXRECOMP_REGS_IN_MODULE "The game module owns the guest registers"
        ${_regs_in_module_default})
 if(XBOXRECOMP_GAME_MODULE)
-    if(WIN32)
-        message(FATAL_ERROR "XBOXRECOMP_GAME_MODULE is not supported on Windows yet")
+    if(WIN32 AND NOT XBOXRECOMP_REGS_IN_MODULE)
+        message(FATAL_ERROR "A Windows game module needs XBOXRECOMP_REGS_IN_MODULE: "
+                            "a DLL cannot import the executable's thread-local registers")
     endif()
     add_compile_definitions(RECOMP_MODULE_HOST)
     if(XBOXRECOMP_REGS_IN_MODULE)
