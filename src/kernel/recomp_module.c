@@ -101,10 +101,20 @@ int recomp_module_load(const char *path, const char *default_name,
 
     g_module = MODULE_OPEN(g_module_path);
     if (!g_module) {
+        /* A shared build carries the kit that makes the module
+         * (scripts/make_kit.py); say how to run it. */
+        char kit[1024];
+        FILE *probe;
+        exe_dir(kit, sizeof kit - 16);
+        strcat(kit, "kit/kit.json");
+        probe = fopen(kit, "rb");
+        if (probe) fclose(probe);
         snprintf(err, err_bytes,
                  "Could not load the game module\n%s\n(%s)\n\n"
-                 "It is built from your own copy of the game; build it first.",
-                 g_module_path, module_error());
+                 "It is built from your own copy of the game; build it first%s",
+                 g_module_path, module_error(),
+                 probe ? ":\n\npython3 kit/toolkit/scripts/build_module.py "
+                         "--xbe <your disc>/default.xbe" : ".");
         return 0;
     }
 

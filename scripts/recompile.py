@@ -81,7 +81,11 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     #
     # The extra sections are a few hundred KB against a 2 MB .text, so the
     # scan costs little; --text-only trades correctness for a few seconds.
-    disasm = [sys.executable, "-m", "tools.disasm", str(xbe)]
+    # The analysis stage one wrote, named rather than found: the disassembler
+    # otherwise looks beside the XBE, which with --json is the wrong place
+    # (and finds a stale file there if one is left over).
+    disasm = [sys.executable, "-m", "tools.disasm", str(xbe),
+              "--analysis-json", str(analysis_json)]
     if args.text_only:
         disasm.append("--text-only")
     # Every stage defaults to one shared tools/*/output directory, and the
@@ -141,7 +145,8 @@ def build_commands(args, xbe: Path, analysis_json: Path):
         lift.append("--trace-all-entries")
     # XDK functions with a name-keyed replacement (tools/recomp/hle.py), used
     # whenever tools.xdk_symbols has been run for this XBE.
-    hle_symbols = xbe.with_name(xbe.stem + "_xdk_symbols.json")
+    hle_symbols = (Path(args.hle_symbols).resolve() if args.hle_symbols
+                   else xbe.with_name(xbe.stem + "_xdk_symbols.json"))
     if hle_symbols.exists():
         lift += ["--hle-symbols", str(hle_symbols)]
     if args.verbose:
@@ -225,6 +230,10 @@ def main() -> int:
     ap.add_argument("--json", metavar="FILE",
                     help="Where to write the stage-1 analysis JSON "
                          "(default: <xbe stem>_analysis.json beside the XBE)")
+    ap.add_argument("--hle-symbols", metavar="FILE",
+                    help="tools.xdk_symbols JSON for this XBE (default: "
+                         "<xbe stem>_xdk_symbols.json beside the XBE, used "
+                         "when it exists)")
     ap.add_argument("--from", dest="start", choices=STAGES, default="parse",
                     metavar="STAGE",
                     help=f"Start from this stage: {', '.join(STAGES)}")
