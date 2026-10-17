@@ -57,6 +57,24 @@ int recomp_module_load(const char *path, const char *default_name,
 /* The path that was loaded (empty before). */
 const char *recomp_module_path(void);
 
+/* ---- a shared build: runtime + title kit (scripts/make_kit.py) ----
+ *
+ * The kit is <exe dir>/kit/. The module it builds lives in the per-user
+ * module cache, in a directory named after the kit id, so an updated build
+ * never loads a module made by an older kit. Keep these in step with
+ * scripts/build_module.py (module_dir, xbe_fingerprint). */
+
+/* <exe dir>/kit when the executable carries a kit (kit/kit.id), else 0. */
+int  recomp_module_kit_dir(char *out, size_t n);
+/* The kit's module: <user data>/xboxrecomp/modules/<title id>/<first 16 of
+ * the kit id>/<module_file>. 0 without a kit. */
+int  recomp_module_kit_module_path(uint32_t title_id, const char *module_file,
+                                   char *out, size_t n);
+/* "<size> <timedate> <title id> <version>" in hex, from an XBE in memory. */
+void recomp_module_xbe_fingerprint(const void *xbe, size_t size, char *out, size_t n);
+/* Whether the module exists and was built from this XBE (its xbe.id). */
+int  recomp_module_is_current(const char *module_path, const void *xbe, size_t size);
+
 /* The module's xbe_entry_point and recomp_dispatch_init. */
 void recomp_module_entry(void);
 int  recomp_module_dispatch_init(void);

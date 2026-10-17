@@ -31,6 +31,23 @@
 #include <fnmatch.h>
 #endif
 
+#include "kernel_disc.h"
+
+/* The host backends below define these under xbox_host_*; the public names
+ * are the wrappers at the end of the file, which give paths and handles on a
+ * mounted disc image to kernel_disc.c first. */
+#define xbox_NtCreateFile xbox_host_NtCreateFile
+#define xbox_NtReadFile xbox_host_NtReadFile
+#define xbox_NtWriteFile xbox_host_NtWriteFile
+#define xbox_NtClose xbox_host_NtClose
+#define xbox_NtDeleteFile xbox_host_NtDeleteFile
+#define xbox_NtQueryInformationFile xbox_host_NtQueryInformationFile
+#define xbox_NtSetInformationFile xbox_host_NtSetInformationFile
+#define xbox_NtQueryVolumeInformationFile xbox_host_NtQueryVolumeInformationFile
+#define xbox_NtFlushBuffersFile xbox_host_NtFlushBuffersFile
+#define xbox_NtQueryFullAttributesFile xbox_host_NtQueryFullAttributesFile
+#define xbox_NtQueryDirectoryFile xbox_host_NtQueryDirectoryFile
+
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
@@ -1417,6 +1434,234 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 /* ======================================================================== */
 /* ====================  Platform-independent  ============================ */
 /* ======================================================================== */
+
+#undef xbox_NtCreateFile
+#undef xbox_NtReadFile
+#undef xbox_NtWriteFile
+#undef xbox_NtClose
+#undef xbox_NtDeleteFile
+#undef xbox_NtQueryInformationFile
+#undef xbox_NtSetInformationFile
+#undef xbox_NtQueryVolumeInformationFile
+#undef xbox_NtFlushBuffersFile
+#undef xbox_NtQueryFullAttributesFile
+#undef xbox_NtQueryDirectoryFile
+
+/* ---- the disc image first (kernel_disc.h) ---- */
+
+NTSTATUS __stdcall xbox_host_NtCreateFile(PHANDLE, ACCESS_MASK, PXBOX_OBJECT_ATTRIBUTES,
+    PXBOX_IO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG);
+NTSTATUS __stdcall xbox_host_NtReadFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
+    PXBOX_IO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER);
+NTSTATUS __stdcall xbox_host_NtWriteFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
+    PXBOX_IO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER);
+NTSTATUS __stdcall xbox_host_NtClose(HANDLE);
+NTSTATUS __stdcall xbox_host_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES);
+NTSTATUS __stdcall xbox_host_NtQueryInformationFile(HANDLE, PXBOX_IO_STATUS_BLOCK, PVOID,
+    ULONG, XBOX_FILE_INFORMATION_CLASS);
+NTSTATUS __stdcall xbox_host_NtSetInformationFile(HANDLE, PXBOX_IO_STATUS_BLOCK, PVOID,
+    ULONG, XBOX_FILE_INFORMATION_CLASS);
+NTSTATUS __stdcall xbox_host_NtQueryVolumeInformationFile(HANDLE, PXBOX_IO_STATUS_BLOCK,
+    PVOID, ULONG, XBOX_FS_INFORMATION_CLASS);
+NTSTATUS __stdcall xbox_host_NtFlushBuffersFile(HANDLE, PXBOX_IO_STATUS_BLOCK);
+NTSTATUS __stdcall xbox_host_NtQueryFullAttributesFile(PXBOX_OBJECT_ATTRIBUTES,
+    PXBOX_FILE_NETWORK_OPEN_INFORMATION);
+NTSTATUS __stdcall xbox_host_NtQueryDirectoryFile(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID,
+    PXBOX_IO_STATUS_BLOCK, PVOID, ULONG, XBOX_FILE_INFORMATION_CLASS, PXBOX_ANSI_STRING,
+    BOOLEAN);
+
+/* The disc path an object names, or NULL: a path under a directory handle
+ * opened on the disc, or an Xbox path the rules put on the disc. */
+static const char *disc_obj_path(PXBOX_OBJECT_ATTRIBUTES oa, char *buf, size_t n)
+{
+    const char *xbox_path;
+    if (!xbox_disc_mounted() || !(xbox_path = get_xbox_path(oa)))
+        return NULL;
+    if (oa->RootDirectory && xbox_path[0] != '\\' && !(xbox_path[0] && xbox_path[1] == ':')) {
+        const char *root = xbox_disc_handle_path(oa->RootDirectory);
+        if (!root)
+            return NULL;
+        snprintf(buf, n, "%s%s%s", root, root[0] ? "/" : "", xbox_path);
+        return buf;
+    }
+    return xbox_disc_path_of(xbox_path, buf, n);
+}
+
+static NTSTATUS disc_done(PXBOX_IO_STATUS_BLOCK iosb, NTSTATUS st, ULONG_PTR info)
+{
+    if (iosb) {
+        iosb->Status = st;
+        iosb->Information = info;
+    }
+    return st;
+}
+
+NTSTATUS __stdcall xbox_NtCreateFile(
+    PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+    PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
+    ULONG CreateDisposition, ULONG CreateOptions)
+{
+    char buf[1024];
+    const char *rel;
+    if (FileHandle && ObjectAttributes &&
+        (rel = disc_obj_path(ObjectAttributes, buf, sizeof buf)) != NULL) {
+        ULONG_PTR info = 0;
+        HANDLE h = NULL;
+        NTSTATUS st = xbox_disc_create(rel, DesiredAccess, CreateDisposition,
+                                       CreateOptions, &h, &info);
+        /* The [PATH] line the host path layer would have printed. */
+        fprintf(stderr, "  [PATH] %s -> disc:/%s\n", get_xbox_path(ObjectAttributes), rel);
+        if (st == STATUS_SUCCESS)
+            *FileHandle = h;
+        else
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtCreateFile FAILED: disc:/%s (0x%08X)",
+                     rel, (unsigned)st);
+        return disc_done(IoStatusBlock, st, info);
+    }
+    return xbox_host_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
+                                  AllocationSize, FileAttributes, ShareAccess,
+                                  CreateDisposition, CreateOptions);
+}
+
+NTSTATUS __stdcall xbox_NtReadFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset)
+{
+    if (xbox_disc_owns(FileHandle)) {
+        ULONG_PTR got = 0;
+        NTSTATUS st;
+        if (!IoStatusBlock)
+            return STATUS_INVALID_PARAMETER;
+        st = xbox_disc_read(FileHandle, Buffer, Length, ByteOffset, &got);
+        if (st == STATUS_SUCCESS && Event)
+            SetEvent(Event);
+        return disc_done(IoStatusBlock, st, got);
+    }
+    return xbox_host_NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                Buffer, Length, ByteOffset);
+}
+
+NTSTATUS __stdcall xbox_NtWriteFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset)
+{
+    if (xbox_disc_owns(FileHandle))
+        return disc_done(IoStatusBlock, STATUS_MEDIA_WRITE_PROTECTED, 0);
+    return xbox_host_NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                 Buffer, Length, ByteOffset);
+}
+
+NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+{
+    if (xbox_disc_owns(Handle)) {
+        xbox_disc_close(Handle);
+        return STATUS_SUCCESS;
+    }
+    return xbox_host_NtClose(Handle);
+}
+
+NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
+{
+    char buf[1024];
+    if (ObjectAttributes && disc_obj_path(ObjectAttributes, buf, sizeof buf))
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    return xbox_host_NtDeleteFile(ObjectAttributes);
+}
+
+NTSTATUS __stdcall xbox_NtQueryInformationFile(
+    HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
+{
+    if (xbox_disc_owns(FileHandle)) {
+        ULONG_PTR written = 0;
+        NTSTATUS st;
+        if (!IoStatusBlock || !FileInformation)
+            return STATUS_INVALID_PARAMETER;
+        st = xbox_disc_query_info(FileHandle, FileInformation, Length,
+                                  (int)FileInformationClass, &written);
+        return disc_done(IoStatusBlock, st, written);
+    }
+    return xbox_host_NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                            Length, FileInformationClass);
+}
+
+NTSTATUS __stdcall xbox_NtSetInformationFile(
+    HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
+{
+    if (xbox_disc_owns(FileHandle)) {
+        if (!IoStatusBlock || !FileInformation)
+            return STATUS_INVALID_PARAMETER;
+        return disc_done(IoStatusBlock,
+                         xbox_disc_set_info(FileHandle, FileInformation, Length,
+                                            (int)FileInformationClass), 0);
+    }
+    return xbox_host_NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                          Length, FileInformationClass);
+}
+
+NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
+    HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
+{
+    if (xbox_disc_owns(FileHandle)) {
+        ULONG_PTR written = 0;
+        NTSTATUS st;
+        if (!IoStatusBlock || !FsInformation)
+            return STATUS_INVALID_PARAMETER;
+        st = xbox_disc_query_volume(FileHandle, FsInformation, Length,
+                                    (int)FsInformationClass, &written);
+        return disc_done(IoStatusBlock, st, written);
+    }
+    return xbox_host_NtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation,
+                                                  Length, FsInformationClass);
+}
+
+NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock)
+{
+    if (xbox_disc_owns(FileHandle))
+        return disc_done(IoStatusBlock, STATUS_SUCCESS, 0);
+    return xbox_host_NtFlushBuffersFile(FileHandle, IoStatusBlock);
+}
+
+NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
+    PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+    PXBOX_FILE_NETWORK_OPEN_INFORMATION FileInformation)
+{
+    char buf[1024];
+    const char *rel;
+    if (FileInformation && ObjectAttributes &&
+        (rel = disc_obj_path(ObjectAttributes, buf, sizeof buf)) != NULL)
+        return xbox_disc_query_attributes(rel, FileInformation);
+    return xbox_host_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+}
+
+NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
+    PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
+{
+    if (xbox_disc_owns(FileHandle)) {
+        ULONG_PTR written = 0;
+        NTSTATUS st;
+        if (!IoStatusBlock || !FileInformation)
+            return STATUS_INVALID_PARAMETER;
+        if (FileInformationClass != XboxFileDirectoryInformation)
+            return disc_done(IoStatusBlock, STATUS_INVALID_INFO_CLASS, 0);
+        st = xbox_disc_query_directory(FileHandle, FileInformation, Length,
+                                       FileName ? FileName->Buffer : NULL,
+                                       FileName && FileName->Buffer ? FileName->Length : 0,
+                                       RestartScan, &written);
+        return disc_done(IoStatusBlock, st, written);
+    }
+    return xbox_host_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                          IoStatusBlock, FileInformation, Length,
+                                          FileInformationClass, FileName, RestartScan);
+}
 
 NTSTATUS __stdcall xbox_NtOpenFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,

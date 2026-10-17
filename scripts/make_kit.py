@@ -9,7 +9,10 @@ game, so it cannot be handed out; what can be handed out is the recipe that
 produces it. A kit is that recipe:
 
     kit.json            what to lift and how to compile it, the XBE it is for
-                        (SHA-256), and the digest of the reference lift
+                        (SHA-256), the digest of the reference lift, and the
+                        kit id (a digest of everything below but zig/)
+    kit.id              the kit id alone, for the runtime: it names the
+                        directory the module is built into
     reference.json      SHA-256 of every generated file of the reference lift
     toolkit/            the lifter (tools/, scripts/recompile.py), the HLE
                         sources it scans for markers, the runtime header it
@@ -61,7 +64,9 @@ TOOLKIT_INCLUDES = ["include", "src", "src/input", "src/kernel", "src/config",
 MODULE_SOURCES = ["src/kernel/recomp_module_abi.c"]
 # The lifter's own packages; tests and caches are left out.
 LIFTER_PACKAGES = ["tools/__init__.py", "tools/xbe_parser", "tools/disasm",
-                   "tools/func_id", "tools/recomp"]
+                   "tools/func_id", "tools/recomp",
+                   # build_module.py reads default.xbe out of a disc image
+                   "tools/xiso"]
 
 
 def manifest_digest(manifest):
@@ -283,11 +288,30 @@ def main():
                       "python": sys.version.split()[0],
                       "capstone": capstone_version()},
     }
+    if args.zig:
+        zig = out / "zig" / ("zig.exe" if (out / "zig" / "zig.exe").exists() else "zig")
+        kit["zig"] = subprocess.run([str(zig), "version"], capture_output=True,
+                                    text=True).stdout.strip() or None
+    reference_text = json.dumps(manifest, indent=1) + "\n"
+    (out / "reference.json").write_text(reference_text)
+    # The kit id: everything that decides what the module is. A runtime that
+    # carries this kit builds into a directory named after it, so a changed
+    # override or seed is a new module, never a stale one reused.
+    h = hashlib.sha256()
+    h.update(json.dumps(kit, sort_keys=True).encode())
+    h.update(reference_text.encode())
+    for part in ("toolkit", "title"):
+        for f in sorted((out / part).rglob("*")):
+            if f.is_file():
+                h.update(f.relative_to(out).as_posix().encode() + b"\0")
+                h.update(hashlib.sha256(f.read_bytes()).digest())
+    kit["kit_id"] = h.hexdigest()
     (out / "kit.json").write_text(json.dumps(kit, indent=2) + "\n")
-    (out / "reference.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    (out / "kit.id").write_text(kit["kit_id"] + "\n")
 
     size = sum(p.stat().st_size for p in out.rglob("*") if p.is_file())
-    print(f"kit written to {out} ({size / 1e6:.1f} MB, reference {digest[:16]})")
+    print(f"kit written to {out} ({size / 1e6:.1f} MB, reference {digest[:16]}, "
+          f"kit id {kit['kit_id'][:16]})")
     return 0
 
 

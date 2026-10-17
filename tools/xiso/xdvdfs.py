@@ -10,8 +10,9 @@ first step is "get me the XBE", and requiring a Rust toolchain or a prebuilt
 binary for it turns a five-line quickstart into a paragraph of setup. Reading a
 tree of fixed-size directory entries is not worth a dependency.
 
-Deliberately not implemented: writing, the video partition, and file timestamps.
-Nothing in the pipeline reads them.
+Deliberately not implemented: the video partition and file timestamps. Nothing
+in the pipeline reads them. write_image() builds an image from a folder (for
+testing the runtime's own reader, src/kernel/kernel_disc.c, without a disc).
 """
 
 import os
@@ -168,3 +169,114 @@ class Xiso:
                 yield from self.walk(sub)
             else:
                 yield path, e
+
+
+def _dir_entries_bytes(entries):
+    """Lay out one directory's entries as XDVDFS wants them: a binary search
+    tree (names compared upper-cased) whose root is the first entry, entries
+    4-byte aligned and never crossing a sector, 0xFF padding. `entries` are
+    (name, sector, size, attr). Returns bytes, a multiple of SECTOR."""
+    order = sorted(entries, key=lambda e: e[0].upper())
+
+    def build(lo, hi):                        # balanced tree over order[lo:hi]
+        if lo >= hi:
+            return None
+        mid = (lo + hi) // 2
+        return (mid, build(lo, mid), build(mid + 1, hi))
+
+    pre = []
+
+    def walk(node):
+        if node:
+            pre.append(node)
+            walk(node[1])
+            walk(node[2])
+
+    walk(build(0, len(order)))
+    offsets, at = {}, 0
+    for mid, _, _ in pre:
+        n = (0x0E + len(order[mid][0]) + 3) & ~3
+        if at // SECTOR != (at + n - 1) // SECTOR:
+            at = (at // SECTOR + 1) * SECTOR
+        offsets[mid] = at
+        at += n
+    out = bytearray(b"\xFF" * (((at + SECTOR - 1) // SECTOR) * SECTOR or SECTOR))
+    for mid, left, right in pre:
+        name, sector, size, attr = order[mid]
+        raw = name.encode("ascii")
+        struct.pack_into("<HHIIBB", out, offsets[mid],
+                         offsets[left[0]] // 4 if left else 0,
+                         offsets[right[0]] // 4 if right else 0,
+                         sector, size, attr, len(raw))
+        o = offsets[mid] + 0x0E
+        out[o:o + len(raw)] = raw
+        pad = (0x0E + len(raw) + 3) & ~3
+        out[o + len(raw):offsets[mid] + pad] = b"\xFF" * (pad - 0x0E - len(raw))
+    return bytes(out)
+
+
+def write_image(src_dir, out_path, base=0, exclude=()):
+    """Write the folder src_dir as an XDVDFS image with the game partition at
+    `base` (0 for an xiso, 0x18300000 for a Redump-style layout; the space in
+    front is left sparse). Names in `exclude` (any case, top level) are left
+    out. Returns the number of files written."""
+    src_dir = os.path.abspath(src_dir)
+    skip = {e.lower() for e in exclude}
+
+    def scan(path, top):
+        kids = []
+        for name in sorted(os.listdir(path)):
+            if top and name.lower() in skip:
+                continue
+            full = os.path.join(path, name)
+            if os.path.isdir(full):
+                kids.append([name, True, scan(full, False), 0, 0])
+            elif os.path.isfile(full):
+                kids.append([name, False, full, os.path.getsize(full), 0])
+        return kids
+
+    root = ["", True, scan(src_dir, True), 0, 0]
+    # Sectors: directories first, then file data, all from sector 33.
+    next_sector = [33]
+    dirs, files = [], []
+
+    def size_dirs(node):
+        # A directory's size depends only on its names, so lay out with dummy
+        # sectors first to learn it.
+        node[3] = len(_dir_entries_bytes([(k[0], 0, 0, 0) for k in node[2]]))
+        node[4] = next_sector[0]
+        next_sector[0] += node[3] // SECTOR
+        dirs.append(node)
+        for k in node[2]:
+            if k[1]:
+                size_dirs(k)
+
+    size_dirs(root)
+    for d in dirs:
+        for k in d[2]:
+            if not k[1]:
+                k[4] = next_sector[0]
+                next_sector[0] += max(1, (k[3] + SECTOR - 1) // SECTOR)
+                files.append(k)
+
+    with open(out_path, "wb") as f:
+        desc = bytearray(SECTOR)
+        desc[0:20] = MAGIC
+        struct.pack_into("<IIQ", desc, 0x14, root[4], root[3], 0)
+        desc[0x7EC:0x7EC + 20] = MAGIC
+        f.seek(base + 32 * SECTOR)
+        f.write(desc)
+        for d in dirs:
+            f.seek(base + d[4] * SECTOR)
+            f.write(_dir_entries_bytes([(k[0], k[4], k[3], ATTR_DIRECTORY if k[1] else 0x20)
+                                        for k in d[2]]))
+        for k in files:
+            f.seek(base + k[4] * SECTOR)
+            with open(k[2], "rb") as src:
+                while True:
+                    chunk = src.read(1 << 22)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        f.truncate(base + next_sector[0] * SECTOR)
+    return len(files)

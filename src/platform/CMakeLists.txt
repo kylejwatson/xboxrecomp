@@ -26,7 +26,8 @@ if(WIN32)
 else()
     # host_sdl.c: the game window, keyboard and gamepads (one SDL thread), and
     # the Win32 calls the shared code reads them through.
-    add_library(platform STATIC win32_compat.c host_sdl.c)
+    # setup_sdl.c: the first-run window of a shared build (recomp_setup.h).
+    add_library(platform STATIC win32_compat.c host_sdl.c setup_sdl.c)
     # posix_include: <windows.h> and <dbghelp.h> that forward to the POSIX
     # Win32 layer, so shared sources keep their includes.
     target_include_directories(platform PUBLIC
@@ -36,7 +37,10 @@ else()
     )
     find_package(Threads REQUIRED)
     find_package(SDL2 REQUIRED)
-    # dl: SymFromAddr is dladdr.
-    target_link_libraries(platform PUBLIC Threads::Threads SDL2::SDL2 ${CMAKE_DL_LIBS})
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SETUP_FONT REQUIRED IMPORTED_TARGET freetype2 fontconfig)
+    # dl: SymFromAddr is dladdr. m: the setup window's easing.
+    target_link_libraries(platform PUBLIC Threads::Threads SDL2::SDL2 ${CMAKE_DL_LIBS}
+                          PRIVATE PkgConfig::SETUP_FONT m)
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()

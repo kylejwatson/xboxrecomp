@@ -5,6 +5,9 @@ Build a title's game module from the player's own XBE, using a title kit
 
     python3 kit/toolkit/scripts/build_module.py --xbe /path/to/default.xbe
 
+--xbe takes the XBE itself, the folder it is in, or the disc image (.iso:
+xiso or a full Redump dump); from an image only default.xbe is read.
+
 The steps:
 
   1. the XBE's SHA-256 must be one the kit was made for;
@@ -14,6 +17,17 @@ The steps:
      because the title's overrides are written against exactly that code;
   4. the generated code, recomp_manual.c and the ABI stamp are compiled and
      linked into <module_name>.so (.dll on Windows).
+
+The module goes to the per-user module cache, in a directory named after
+the kit (module_dir()): that is where the runtime looks when it carries a
+kit, and a new kit builds into a new directory rather than over a module
+another build of the runtime may still use. Beside it, xbe.id records which
+XBE it was built from (xbe_fingerprint()), so the runtime can tell when the
+player has switched discs.
+
+--check stops after step 1 (a launcher validating a disc the player chose);
+--progress adds lines "@progress <from> <to> <what>" for a launcher's bar:
+the build is between <from> and <to> percent until the next such line.
 
 The compiler is, in order: --cc; $RECOMP_MODULE_CC; the kit's own Zig
 (kit/zig/zig, `zig cc`); a `zig` on PATH; clang; gcc. Objects are kept in
@@ -30,9 +44,12 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
+import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -48,6 +65,31 @@ def fail(msg):
 
 def say(msg):
     print(msg, flush=True)
+
+
+PROGRESS = False
+
+
+def progress(lo, hi, what):
+    if PROGRESS:
+        print(f"@progress {lo} {hi} {what}", flush=True)
+
+
+def stop_with_parent():
+    """For a launcher's child (--progress): if the launcher goes away, take
+    the lifter and the compilers down too rather than build for nobody. The
+    launcher starts this script as its own process group's leader."""
+    if sys.platform == "win32" or os.getpgid(0) != os.getpid():
+        return
+    parent = os.getppid()
+
+    def watch():
+        while True:
+            time.sleep(1.0)
+            if os.getppid() != parent:
+                os.killpg(0, 15)
+
+    threading.Thread(target=watch, daemon=True).start()
 
 
 def sha256_file(path):
@@ -77,6 +119,63 @@ def default_work_dir(kit):
     else:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     return base / "xboxrecomp" / "module-build" / (kit["title_id"] or "title")
+
+
+def module_dir(kit):
+    """Where the runtime finds a kit's module: <user data>/xboxrecomp/modules/
+    <title id>/<first 16 of the kit id>. Keep in step with recomp_module.c."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    return (base / "xboxrecomp" / "modules" / (kit["title_id"] or "title")
+            / kit["kit_id"][:16])
+
+
+def xbe_fingerprint(data):
+    """"<size> <timedate> <title id> <version>" in hex, from the XBE header and
+    certificate: cheap enough for the runtime to compute at every start (it
+    has the XBE in memory) and different between releases. Keep in step with
+    recomp_module.c."""
+    base, timedate, cert = struct.unpack_from("<I12xII", data, 0x104)
+    title_id, = struct.unpack_from("<I", data, cert - base + 0x08)
+    version, = struct.unpack_from("<I", data, cert - base + 0xAC)
+    return f"{len(data):x} {timedate:08x} {title_id:08x} {version:08x}"
+
+
+def read_disc_xbe(path, work, toolkit):
+    """The XBE's bytes and a path to it on disk, from an XBE, a folder holding
+    default.xbe, or a disc image (default.xbe copied out into the work dir)."""
+    path = Path(path)
+    if path.is_dir():
+        hits = [p for p in path.iterdir() if p.name.lower() == "default.xbe"]
+        if not hits:
+            fail(f"{path} has no default.xbe: choose the folder the disc was "
+                 f"extracted to, or the disc image itself")
+        path = hits[0]
+    if not path.is_file():
+        fail(f"no such file: {path}")
+    with open(path, "rb") as f:
+        head = f.read(4)
+    if head == b"XBEH":
+        return path.read_bytes(), path
+    sys.path.insert(0, str(toolkit))
+    try:
+        from tools.xiso.xdvdfs import Xiso, XisoError
+    except ImportError:
+        fail("this kit cannot read disc images (no tools/xiso); give the "
+             "extracted default.xbe")
+    try:
+        with Xiso(str(path)) as iso:
+            entry = iso.find("default.xbe")
+            if entry is None:
+                fail(f"{path.name} is an Xbox disc image with no default.xbe")
+            work.mkdir(parents=True, exist_ok=True)
+            out = work / "default.xbe"
+            iso.extract(entry, str(out))
+    except XisoError as e:
+        fail(f"{path.name} is neither an XBE nor an Xbox disc image ({e})")
+    return out.read_bytes(), out
 
 
 def module_suffix():
@@ -154,10 +253,12 @@ def compile_one(cc, flags, src, obj):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--xbe", required=True, help="default.xbe from the player's disc")
+    ap.add_argument("--xbe", "--disc", dest="xbe", required=True,
+                    help="the player's default.xbe, the folder it is in, or "
+                         "the disc image")
     ap.add_argument("--kit", default=str(DEFAULT_KIT), help="the title kit")
-    ap.add_argument("--out", help="module file to write (default: beside the "
-                                  "kit directory, i.e. beside the executable)")
+    ap.add_argument("--out", help="module file to write (default: the per-user "
+                                  "module cache, see module_dir)")
     ap.add_argument("--work-dir", help="lift and object cache "
                                        "(default: the user cache directory)")
     ap.add_argument("--cc", help="C compiler command (e.g. 'zig cc', clang)")
@@ -167,7 +268,17 @@ def main():
                          "reference (the overrides may then be wrong)")
     ap.add_argument("--relift", action="store_true",
                     help="lift again even if the cached lift matches")
+    ap.add_argument("--check", action="store_true",
+                    help="only check that the disc is one this kit supports")
+    ap.add_argument("--progress", action="store_true",
+                    help="print @progress lines for a launcher")
+    ap.add_argument("--print-module-path", action="store_true",
+                    help="print where the module goes and exit")
     args = ap.parse_args()
+    global PROGRESS
+    PROGRESS = args.progress
+    if PROGRESS:
+        stop_with_parent()
 
     started = time.time()
     kit_dir = Path(args.kit).resolve()
@@ -180,17 +291,26 @@ def main():
         fail(f"kit format {kit.get('format')} is not supported by this script "
              f"(expects {KIT_FORMAT})")
 
-    xbe = Path(args.xbe).resolve()
-    if not xbe.is_file():
-        fail(f"no such file: {xbe}")
-    say(f"checking {xbe.name}...")
-    xbe_sha = sha256_file(xbe)
-    if xbe_sha not in kit["xbe_sha256"]:
-        fail(f"{xbe} is not the release this build supports "
-             f"({kit['game_name']}, SHA-256 {kit['xbe_sha256'][0][:16]}...; "
-             f"this file is {xbe_sha[:16]}...)")
+    if "kit_id" not in kit:
+        fail("this kit has no kit_id; make it again with scripts/make_kit.py")
+    out = (Path(args.out).resolve() if args.out
+           else module_dir(kit) / (kit["module_name"] + module_suffix()))
+    if args.print_module_path:
+        print(out)
+        return 0
 
     work = Path(args.work_dir).resolve() if args.work_dir else default_work_dir(kit)
+    progress(0, 2, "Checking the disc")
+    say(f"checking {args.xbe}...")
+    xbe_data, xbe = read_disc_xbe(Path(args.xbe).resolve(), work, kit_dir / "toolkit")
+    xbe_sha = hashlib.sha256(xbe_data).hexdigest()
+    if xbe_sha not in kit["xbe_sha256"]:
+        fail(f"this is not the release this build supports ({kit['game_name']}: "
+             f"the disc's default.xbe has SHA-256 {xbe_sha[:16]}..., expected "
+             f"{kit['xbe_sha256'][0][:16]}...)")
+    if args.check:
+        say(f"ok {xbe_sha}")
+        return 0
     gen_dir = work / "gen"
     obj_dir = work / "obj"
     work.mkdir(parents=True, exist_ok=True)
@@ -230,10 +350,36 @@ def main():
                 f"{want_cs}; the result is checked below")
         say("lifting the game code (several minutes; log: "
             f"{work / 'lift.log'})...")
-        env = dict(os.environ, PYTHONHASHSEED="0")
+        # Unbuffered: the stage headers are what the progress follower reads.
+        env = dict(os.environ, PYTHONHASHSEED="0", PYTHONUNBUFFERED="1")
+        # The lifter's four stages, as shares of the 2..75% the lift gets
+        # (measured: disassembly and identification are most of it).
+        stages = {"parse": (2, 4, "Reading the game's executable"),
+                  "disasm": (4, 40, "Disassembling the game code"),
+                  "identify": (40, 52, "Identifying functions"),
+                  "lift": (52, 75, "Translating the game code to C")}
+        progress(2, 4, stages["parse"][2])
+        done = threading.Event()
+
+        def follow():
+            seen = set()
+            while not done.wait(1.0):
+                try:
+                    text = (work / "lift.log").read_text(errors="replace")
+                except OSError:
+                    continue
+                for name in re.findall(r"^\s+\d/4\s+(\w+)\s*$", text, re.M):
+                    if name in stages and name not in seen:
+                        seen.add(name)
+                        progress(*stages[name])
+
+        watcher = threading.Thread(target=follow, daemon=True)
+        watcher.start()
         with open(work / "lift.log", "w") as log:
             r = subprocess.run(argv, cwd=toolkit, env=env, stdout=log,
                                stderr=subprocess.STDOUT)
+        done.set()
+        watcher.join()
         if r.returncode != 0:
             fail(f"the lift failed; see {work / 'lift.log'}")
         ok, diff = lift_matches()
@@ -253,6 +399,7 @@ def main():
     objs = []
     jobs = []
     say(f"compiling {len(sources)} files with {cc_name}, {args.jobs} at a time...")
+    progress(75, 98, "Compiling")
     t0 = time.time()
     with cf.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         for src in sources:
@@ -268,13 +415,18 @@ def main():
                 sys.stderr.write(err + "\n")
                 fail(f"compiling {Path(src).name} failed")
             built += compiled
-            print(f"\r  {done}/{len(sources)}", end="", flush=True)
-    print()
+            if PROGRESS:
+                lo = 75 + 23 * done // len(sources)
+                progress(lo, min(98, lo + 2), f"Compiling ({done} of {len(sources)})")
+            else:
+                print(f"\r  {done}/{len(sources)}", end="", flush=True)
+    if not PROGRESS:
+        print()
     say(f"compiled {built} ({len(sources) - built} up to date) in "
         f"{time.time() - t0:.0f} s")
 
-    out = (Path(args.out).resolve() if args.out
-           else kit_dir.parent / (kit["module_name"] + module_suffix()))
+    progress(98, 100, "Linking")
+    out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.name + ".tmp")
     link = cc + ["-shared", "-o", str(tmp)] + [str(o) for o in objs]
     if sys.platform != "win32":
@@ -287,10 +439,12 @@ def main():
         sys.stderr.write((r.stderr or r.stdout)[-3000:] + "\n")
         fail("linking the module failed")
     os.replace(tmp, out)
+    (out.parent / "xbe.id").write_text(xbe_fingerprint(xbe_data) + "\n")
     (work / "built.json").write_text(json.dumps({
         "module": str(out), "xbe_sha256": xbe_sha,
         "reference": kit["reference"]["digest"], "compiler": cc_name,
         "module_abi": kit["module_abi"]}, indent=2) + "\n")
+    progress(100, 100, "Done")
     say(f"wrote {out} ({out.stat().st_size / 1e6:.1f} MB) in "
         f"{time.time() - started:.0f} s")
     return 0

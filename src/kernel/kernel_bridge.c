@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "kernel_disc.h"
 #ifdef _WIN32
 #include <mmsystem.h>      /* timeBeginPeriod, for the vblank clock's fallback */
 #else
@@ -636,7 +637,9 @@ static void bridge_NtClose(void)
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
-        if (h && h != INVALID_HANDLE_VALUE)
+        if (xbox_disc_owns(h))
+            xbox_disc_close(h);             /* a file on the disc image */
+        else if (h && h != INVALID_HANDLE_VALUE)
             CloseHandle(h);
     }
     g_eax = 0; /* STATUS_SUCCESS */
@@ -3932,7 +3935,9 @@ static void bridge_NtReadFile(void)
     int async_file = bridge_handle_is_async(STACK_ARG(0));
     LARGE_INTEGER saved_pos;
     saved_pos.QuadPart = 0;
-    if (async_file) {
+    if (async_file && xbox_disc_owns(handle)) {
+        saved_pos.QuadPart = xbox_disc_tell(handle);    /* disc image file */
+    } else if (async_file) {
         LARGE_INTEGER zero;
         zero.QuadPart = 0;
         if (!SetFilePointerEx(handle, zero, &saved_pos, FILE_CURRENT))
@@ -3940,7 +3945,9 @@ static void bridge_NtReadFile(void)
     }
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
-    if (async_file)
+    if (async_file && xbox_disc_owns(handle))
+        xbox_disc_seek(handle, saved_pos.QuadPart);
+    else if (async_file)
         SetFilePointerEx(handle, saved_pos, NULL, FILE_BEGIN);
 
     /* What a read actually delivered. A decoder that rejects its input cannot
@@ -5974,6 +5981,19 @@ static void bridge_NtDuplicateObject(void)
     if (STACK_ARG(2) & 0x1) opts |= DUPLICATE_CLOSE_SOURCE;
     if (STACK_ARG(2) & 0x2) opts |= DUPLICATE_SAME_ACCESS;
 
+    if (xbox_disc_owns(src)) {
+        /* A file on the disc image: its own handle kind (kernel_disc.c). */
+        dup = xbox_disc_duplicate(src);
+        if (!dup) {
+            g_eax = 0xC000009Au;   /* STATUS_INSUFFICIENT_RESOURCES */
+            return;
+        }
+        if (opts & DUPLICATE_CLOSE_SOURCE)
+            xbox_disc_close(src);
+        bridge_write_handle(target_va, dup);
+        g_eax = 0;
+        return;
+    }
     if (!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
                          &dup, 0, FALSE, opts)) {
         g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */

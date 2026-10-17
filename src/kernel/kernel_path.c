@@ -13,6 +13,7 @@
  */
 
 #include "kernel.h"
+#include "kernel_disc.h"
 #include "xbox_watchpoint.h"
 #include <stdio.h>
 #include <string.h>
@@ -91,6 +92,40 @@ static const path_rule s_rules[] = {
     { "\\??\\T:\\",                           1, "\\TitleData","/TitleData"  },
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
+
+/*
+ * With a disc image mounted (kernel_disc.h), the game side of the rules is the
+ * image -- except Partition1, which on a console is the hard disk's E: (UDATA,
+ * TDATA) and goes to <save dir>/E, since nothing can be written to an image.
+ * An extracted folder keeps the old mapping, saves and all.
+ */
+static int rule_is_partition1(int i)
+{
+    return strcmp(s_rules[i].prefix, "\\Device\\Harddisk0\\Partition1\\") == 0;
+}
+
+/* "xboxdisc:/<rest>" with '/' separators and no trailing one. */
+static void disc_host_path(const char *remainder, char *out, size_t n)
+{
+    size_t len;
+    char *q;
+    snprintf(out, n, "%s/%s", XBOX_DISC_PATH_PREFIX, remainder);
+    for (q = out; *q; q++)
+        if (*q == '\\')
+            *q = '/';
+    len = strlen(out);
+    while (len > sizeof XBOX_DISC_PATH_PREFIX && out[len - 1] == '/')
+        out[--len] = '\0';
+}
+
+/* A game directory that is a disc image is mounted, once. */
+static void mount_if_image(const char *game_dir)
+{
+    char err[1200];
+    if (game_dir && !xbox_disc_mounted() && xbox_disc_is_image(game_dir) &&
+        !xbox_disc_mount(game_dir, err, sizeof err))
+        fprintf(stderr, "[DISC] %s\n", err);
+}
 
 /*
  * Rewrite a path through a drive letter the title mapped for itself.
@@ -225,6 +260,31 @@ static int xbox_partition_device_digit(const char *xbox_path)
     return *rest ? -1 : xbox_path[len] - '0';
 }
 
+/* The path on the mounted disc an Xbox path names, without printing or
+ * creating anything (kernel_file.c asks this before the host backends see a
+ * path). Returns NULL when no disc is mounted or the path is elsewhere. */
+const char *xbox_disc_path_of(const char *xbox_path, char *buf, size_t n)
+{
+    char linked[512];
+    int i, skip;
+    if (!xbox_disc_mounted() || !xbox_path)
+        return NULL;
+    if (resolve_symlink(xbox_path, linked, sizeof linked))
+        xbox_path = linked;
+    if (xbox_partition_device_digit(xbox_path) >= 0)
+        return NULL;
+    for (i = 0; i < PATH_RULE_COUNT; i++) {
+        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        if (!skip)
+            continue;
+        if (s_rules[i].to_save || rule_is_partition1(i))
+            return NULL;
+        disc_host_path(xbox_path + skip, buf, n);
+        return xbox_disc_host_rel(buf);
+    }
+    return NULL;
+}
+
 #if defined(_WIN32)
 /* ======================================================================== */
 
@@ -293,6 +353,8 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     WCHAR save_base[MAX_PATH];
+
+    mount_if_image(game_dir);
 
     /* The fallbacks used to name Burnout 3 specifically, so any other title
      * that passed NULL silently pointed its game dir and its saves at another
@@ -430,6 +492,23 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_win;
+            if (!s_rules[i].to_save && xbox_disc_mounted()) {
+                if (rule_is_partition1(i)) {
+                    base_dir = s_save_dir;
+                    sub_dir  = "\\E";
+                } else {
+                    char disc[MAX_PATH * 2];
+                    int k;
+                    disc_host_path(remainder, disc, sizeof disc);
+                    for (k = 0; disc[k] && k < (int)buf_size - 1; k++)
+                        host_path_buf[k] = (WCHAR)(unsigned char)disc[k];
+                    host_path_buf[k] = 0;
+                    fprintf(stderr, "  [PATH] %s -> disc\n", xbox_path);
+                    xbox_watch_note_path(xbox_path);
+                    xbox_remember_host_path(host_path_buf);
+                    return TRUE;
+                }
+            }
             goto translate;
         }
     }
@@ -604,6 +683,7 @@ static void mkdir_p(const char* path)
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
+    mount_if_image(game_dir);
     if (game_dir) {
         snprintf(s_game_dir, sizeof(s_game_dir), "%s", game_dir);
     } else {
@@ -708,6 +788,18 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_posix;
+            if (!s_rules[i].to_save && xbox_disc_mounted()) {
+                if (rule_is_partition1(i)) {
+                    base_dir = s_save_dir;
+                    sub_dir  = "/E";
+                } else {
+                    disc_host_path(remainder, host_path_buf, buf_size);
+                    fprintf(stderr, "  [PATH] %s -> disc\n", xbox_path);
+                    xbox_watch_note_path(xbox_path);
+                    xbox_remember_host_path(host_path_buf);
+                    return TRUE;
+                }
+            }
             goto translate;
         }
     }

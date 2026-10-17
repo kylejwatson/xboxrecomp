@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <sys/stat.h>
+
 #if defined(_WIN32)
 #  include <windows.h>
 #  define MODULE_OPEN(p)      ((void *)LoadLibraryA(p))
@@ -156,6 +158,90 @@ int recomp_module_load(const char *path, const char *default_name,
     fprintf(stderr, "[MODULE] %s: ABI %u, %d HLE imports filled, %d absent\n",
             g_module_path, (unsigned)*abi, filled, missing);
     return 1;
+}
+
+int recomp_module_kit_dir(char *out, size_t n)
+{
+    char probe[1100];
+    struct stat st;
+    exe_dir(out, n > 8 ? n - 8 : n);
+    strcat(out, "kit");
+    snprintf(probe, sizeof probe, "%s%ckit.id", out, PATH_SEP_CHAR);
+    return stat(probe, &st) == 0;
+}
+
+int recomp_module_kit_module_path(uint32_t title_id, const char *module_file,
+                                  char *out, size_t n)
+{
+    char kit[1024], idfile[1100], id[80] = "", base[1024];
+    const char *env;
+    FILE *f;
+    size_t len;
+
+    if (!recomp_module_kit_dir(kit, sizeof kit))
+        return 0;
+    snprintf(idfile, sizeof idfile, "%s%ckit.id", kit, PATH_SEP_CHAR);
+    if (!(f = fopen(idfile, "rb")))
+        return 0;
+    if (!fgets(id, sizeof id, f))
+        id[0] = '\0';
+    fclose(f);
+    len = strspn(id, "0123456789abcdef");
+    if (len < 16)
+        return 0;
+    id[16] = '\0';
+#if defined(_WIN32)
+    env = getenv("LOCALAPPDATA");
+    snprintf(base, sizeof base, "%s", env && *env ? env : ".");
+#else
+    env = getenv("XDG_DATA_HOME");
+    if (env && *env)
+        snprintf(base, sizeof base, "%s", env);
+    else
+        snprintf(base, sizeof base, "%s/.local/share",
+                 getenv("HOME") ? getenv("HOME") : ".");
+#endif
+    snprintf(out, n, "%s%cxboxrecomp%cmodules%c%08X%c%s%c%s", base, PATH_SEP_CHAR,
+             PATH_SEP_CHAR, PATH_SEP_CHAR, (unsigned)title_id, PATH_SEP_CHAR, id,
+             PATH_SEP_CHAR, module_file);
+    return 1;
+}
+
+void recomp_module_xbe_fingerprint(const void *xbe, size_t size, char *out, size_t n)
+{
+    const uint8_t *x = (const uint8_t *)xbe;
+    uint32_t base, timedate, cert, title = 0, version = 0;
+    out[0] = '\0';
+    if (size < 0x11C)
+        return;
+    memcpy(&base, x + 0x104, 4);
+    memcpy(&timedate, x + 0x114, 4);
+    memcpy(&cert, x + 0x118, 4);
+    if (cert >= base && (size_t)(cert - base) + 0xB0 <= size) {
+        memcpy(&title, x + (cert - base) + 0x08, 4);
+        memcpy(&version, x + (cert - base) + 0xAC, 4);
+    }
+    snprintf(out, n, "%zx %08x %08x %08x", size, (unsigned)timedate, (unsigned)title,
+             (unsigned)version);
+}
+
+int recomp_module_is_current(const char *module_path, const void *xbe, size_t size)
+{
+    char idfile[1100], have[128] = "", want[128];
+    const char *slash = strrchr(module_path, PATH_SEP_CHAR);
+    struct stat st;
+    FILE *f;
+    if (stat(module_path, &st) != 0 || !slash)
+        return 0;
+    snprintf(idfile, sizeof idfile, "%.*sxbe.id", (int)(slash - module_path + 1), module_path);
+    if (!(f = fopen(idfile, "rb")))
+        return 0;
+    if (!fgets(have, sizeof have, f))
+        have[0] = '\0';
+    fclose(f);
+    have[strcspn(have, "\r\n")] = '\0';
+    recomp_module_xbe_fingerprint(xbe, size, want, sizeof want);
+    return want[0] && strcmp(have, want) == 0;
 }
 
 const char *recomp_module_path(void)

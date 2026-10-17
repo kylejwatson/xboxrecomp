@@ -139,6 +139,31 @@ def test_non_xdvdfs_fails_loudly():
             raise AssertionError("expected XisoError")
 
 
+def test_write_image_round_trips():
+    from tools.xiso.xdvdfs import write_image
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(os.path.join(src, "Pak", "sub"))
+        names = ["n%03d.bin" % i for i in range(150)]   # several directory sectors
+        for i, n in enumerate(names):
+            with open(os.path.join(src, "Pak", n), "wb") as f:
+                f.write(bytes([i % 256]) * (i * 37))
+        with open(os.path.join(src, "default.xbe"), "wb") as f:
+            f.write(b"XBEH" + b"x" * 5000)
+        with open(os.path.join(src, "Pak", "sub", "deep.txt"), "wb") as f:
+            f.write(b"deep")
+        for base in (0, 0x18300000):
+            out = os.path.join(tmp, "o%x.iso" % base)
+            assert write_image(src, out, base=base) == 152
+            with Xiso(out) as iso:
+                assert iso.base == base
+                got = {(d + "/" + e.name).lstrip("/"): iso.read(e) for d, e in iso.walk()}
+                assert got["default.xbe"].startswith(b"XBEH")
+                assert got["Pak/sub/deep.txt"] == b"deep"
+                assert got["Pak/n149.bin"] == bytes([149]) * (149 * 37)
+                assert len(got) == 152
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

@@ -4,13 +4,14 @@ List or extract files from an Xbox disc image.
     py -3 -m tools.xiso ls      game.iso
     py -3 -m tools.xiso get     game.iso default.xbe -o game/
     py -3 -m tools.xiso unpack  game.iso -o extracted/
+    py -3 -m tools.xiso pack    extracted/ -o game.iso [--redump]
 """
 
 import argparse
 import os
 import sys
 
-from .xdvdfs import Xiso, XisoError
+from .xdvdfs import Xiso, XisoError, write_image
 
 
 def cmd_ls(args):
@@ -50,6 +51,13 @@ def cmd_unpack(args):
     return 0
 
 
+def cmd_pack(args):
+    base = 0x18300000 if args.redump else 0
+    n = write_image(args.folder, args.output, base=base, exclude=args.exclude)
+    print("packed %d files into %s (game partition at 0x%X)" % (n, args.output, base))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="tools.xiso", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -69,6 +77,15 @@ def main(argv=None):
     p.add_argument("iso")
     p.add_argument("-o", "--output", required=True)
     p.set_defaults(func=cmd_unpack)
+
+    p = sub.add_parser("pack", help="build an image from a folder (for testing)")
+    p.add_argument("folder")
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--redump", action="store_true",
+                   help="put the game partition at 0x18300000, as a full Redump dump")
+    p.add_argument("--exclude", action="append", default=[],
+                   help="top-level name to leave out (repeatable)")
+    p.set_defaults(func=cmd_pack)
 
     args = ap.parse_args(argv)
     try:
