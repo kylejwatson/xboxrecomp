@@ -401,6 +401,85 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
+/* The guest registers: one per-thread block whose fields g_eax and the rest
+ * name. See templates/runtime/recomp_types.h, which has an identical copy
+ * (the guard lets a file include both; recomp_module_load compares the
+ * layouts).
+ *
+ * Who owns the block. In a static build, and in a module build where the
+ * executable keeps it (Linux: a shared object may reference the executable's
+ * thread-locals at a fixed offset), it is g_regs, defined in
+ * xbox_memory_layout.c. With RECOMP_REGS_IN_MODULE the game module defines
+ * g_regs (src/kernel/recomp_module_abi.c), because a Windows DLL cannot
+ * import an executable's __declspec(thread) data; the runtime then reaches
+ * this thread's block through a pointer it asks the module for once per
+ * thread. Until the module is loaded the runtime uses a block of its own,
+ * whose contents recomp_regs_attach moves into the module's for the loading
+ * thread; no guest thread exists yet at that point. */
+#ifndef RECOMP_GUEST_REGS_DEFINED
+#define RECOMP_GUEST_REGS_DEFINED
+typedef struct RecompGuestRegs {
+    uint32_t  r_eax, r_ecx, r_edx, r_esp, r_ebx, r_esi, r_edi, r_ebp;
+    uint32_t  r_seh_ebp, r_fs_base;
+    uint32_t  r_icall_saved_esp, r_icall_dispatch_form;
+    int       r_df, r_fp_top, r_fp_cmp;
+    uint16_t  r_fp_control_word, r_fp_cc;
+    double    r_fp_stack[8];
+    RecompMmx r_mm0, r_mm1, r_mm2, r_mm3, r_mm4, r_mm5, r_mm6, r_mm7;
+    RecompXmm r_xmm0, r_xmm1, r_xmm2, r_xmm3, r_xmm4, r_xmm5, r_xmm6, r_xmm7;
+} RecompGuestRegs;
+
+#if defined(RECOMP_MODULE_HOST) && defined(RECOMP_REGS_IN_MODULE)
+extern RECOMP_TLS RecompGuestRegs *g_regs_ptr;
+RecompGuestRegs *recomp_regs_slow(void);
+static inline RecompGuestRegs *recomp_regs(void)
+{
+    RecompGuestRegs *r = g_regs_ptr;
+    return r ? r : recomp_regs_slow();
+}
+#  define RECOMP_REGS (*recomp_regs())
+/* Called by recomp_module_load with the module's accessor. */
+void recomp_regs_attach(RecompGuestRegs *(*module_regs)(void));
+#else
+extern RECOMP_TLS RecompGuestRegs g_regs;
+#  define RECOMP_REGS g_regs
+#endif
+#define g_eax (RECOMP_REGS.r_eax)
+#define g_ecx (RECOMP_REGS.r_ecx)
+#define g_edx (RECOMP_REGS.r_edx)
+#define g_esp (RECOMP_REGS.r_esp)
+#define g_ebx (RECOMP_REGS.r_ebx)
+#define g_esi (RECOMP_REGS.r_esi)
+#define g_edi (RECOMP_REGS.r_edi)
+#define g_ebp (RECOMP_REGS.r_ebp)
+#define g_seh_ebp (RECOMP_REGS.r_seh_ebp)
+#define g_fs_base (RECOMP_REGS.r_fs_base)
+#define g_icall_saved_esp (RECOMP_REGS.r_icall_saved_esp)
+#define g_icall_dispatch_form (RECOMP_REGS.r_icall_dispatch_form)
+#define g_df (RECOMP_REGS.r_df)
+#define g_fp_top (RECOMP_REGS.r_fp_top)
+#define g_fp_cmp (RECOMP_REGS.r_fp_cmp)
+#define g_fp_control_word (RECOMP_REGS.r_fp_control_word)
+#define g_fp_cc (RECOMP_REGS.r_fp_cc)
+#define g_fp_stack (RECOMP_REGS.r_fp_stack)
+#define g_mm0 (RECOMP_REGS.r_mm0)
+#define g_mm1 (RECOMP_REGS.r_mm1)
+#define g_mm2 (RECOMP_REGS.r_mm2)
+#define g_mm3 (RECOMP_REGS.r_mm3)
+#define g_mm4 (RECOMP_REGS.r_mm4)
+#define g_mm5 (RECOMP_REGS.r_mm5)
+#define g_mm6 (RECOMP_REGS.r_mm6)
+#define g_mm7 (RECOMP_REGS.r_mm7)
+#define g_xmm0 (RECOMP_REGS.r_xmm0)
+#define g_xmm1 (RECOMP_REGS.r_xmm1)
+#define g_xmm2 (RECOMP_REGS.r_xmm2)
+#define g_xmm3 (RECOMP_REGS.r_xmm3)
+#define g_xmm4 (RECOMP_REGS.r_xmm4)
+#define g_xmm5 (RECOMP_REGS.r_xmm5)
+#define g_xmm6 (RECOMP_REGS.r_xmm6)
+#define g_xmm7 (RECOMP_REGS.r_xmm7)
+#endif
+
 #define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
 /* The runtime's own low memory -- kernel data exports, the main thread's
@@ -445,7 +524,12 @@ extern uint32_t g_xbox_low_shift;
  * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
  * it. */
 #define XBOX_TIB_MAIN       0x00001000
-extern RECOMP_TLS uint32_t g_fs_base;
+/* A thread's registers before it has run anything: the main TIB (a spawned
+ * thread gets its own from xbox_AllocThreadTib), and the x87 reset state,
+ * which masks every exception and rounds to nearest as the CRT expects
+ * before _control87. Every thread's block starts as this. */
+#define RECOMP_REGS_INIT { .r_fs_base = XBOX_TIB_MAIN, \
+                           .r_fp_control_word = 0x037Fu, .r_fp_cc = 0x4000 }
 #define XBOX_FS_BASE        g_fs_base
 
 #define XBOX_STACK_BASE     XBOX_LOW_VA(0x00780000)   /* see XBOX_LOW_VA */

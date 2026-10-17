@@ -1275,10 +1275,36 @@ uint32_t g_xbox_image_hi = 0;
 uint32_t g_xbox_code_lo = 0;
 uint32_t g_xbox_code_hi = 0;
 
-/* Global registers for recompiled code (via recomp_types.h) */
-/* Each guest thread's TIB. The first thread uses the one the loader built;
- * a spawned thread gets its own from xbox_AllocThreadTib(). */
-RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
+/* The guest registers for recompiled code (via recomp_types.h): one
+ * per-thread block, see xbox_memory_layout.h for who owns it. The comments on
+ * its fields are below, where each used to be defined on its own.
+ *
+ * g_fs_base: each guest thread's TIB. The first thread uses the one the
+ * loader built; a spawned thread gets its own from xbox_AllocThreadTib(). */
+#if defined(RECOMP_MODULE_HOST) && defined(RECOMP_REGS_IN_MODULE)
+RECOMP_TLS RecompGuestRegs *g_regs_ptr;
+static RECOMP_TLS RecompGuestRegs g_regs_local = RECOMP_REGS_INIT;
+static RecompGuestRegs *(*g_module_regs)(void);
+
+RecompGuestRegs *recomp_regs_slow(void)
+{
+    /* Only the module's block is cached: before the module is loaded a
+     * thread's registers are its local block, which attach hands over. */
+    if (!g_module_regs)
+        return &g_regs_local;
+    return g_regs_ptr = g_module_regs();
+}
+
+void recomp_regs_attach(RecompGuestRegs *(*module_regs)(void))
+{
+    RecompGuestRegs *r = module_regs();
+    *r = g_regs_local;
+    g_regs_ptr = r;
+    g_module_regs = module_regs;
+}
+#else
+RECOMP_TLS RecompGuestRegs g_regs = RECOMP_REGS_INIT;
+#endif
 
 /* How far the runtime's low memory moved to clear the image; see XBOX_LOW_VA. */
 uint32_t g_xbox_low_shift = 0;
@@ -1318,20 +1344,16 @@ uint32_t xbox_CurrentThreadObject(void)
  * at is. Zero total means the image had no TLS directory. */
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
-RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
-
-/* The guest esp an indirect-call dispatch captured, for the diagnostics that
+/* g_icall_saved_esp: the guest esp an indirect-call dispatch captured, for the diagnostics that
  * need the call site. g_esp is not it: a lifted caller pushes its return
  * address onto a *local* esp and only syncs g_esp at certain points, so by
  * the time a refused call is reported g_esp is stale and reads as 0. The
  * dispatch macros set this to the esp they were handed; a title whose
  * generated header predates them leaves it 0, and the log says so rather
  * than inventing a caller. */
-RECOMP_TLS uint32_t g_icall_saved_esp = 0;
 
-/* Which dispatch form was refused: 0 unknown, 1 call, 2 jump. */
-RECOMP_TLS uint32_t g_icall_dispatch_form = 0;
-RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+/* g_icall_dispatch_form: which dispatch form was refused: 0 unknown,
+ * 1 call, 2 jump. */
 
 #ifdef RECOMP_ABI_CHECK
 /* Report a lifted function that returned without restoring ebx/esi/edi.
@@ -1434,25 +1456,16 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 }
 #endif
 
-/* SEH frame pointer bridge (see recomp_types.h for explanation) */
-RECOMP_TLS uint32_t g_seh_ebp = 0;
-RECOMP_TLS double g_fp_stack[8];
-RECOMP_TLS int g_fp_top = 0;
+/* g_seh_ebp: the SEH frame pointer bridge (see recomp_types.h). */
 
 /* Set once at startup. The generated code reads it at the ret of every
  * --force-return function, so it has to be cheap and it has to default to
  * off: a build carrying forced functions behaves normally until the
  * variable is set. */
 int g_force_return = 0;
-/* x87 control and status. The reset default masks every exception and
- * rounds to nearest, which is what the CRT expects before _control87. */
-RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
-RECOMP_TLS int g_fp_cmp = 0;
-RECOMP_TLS uint16_t g_fp_cc = 0x4000;
-
-/* Defined below, with the other guest registers. */
-extern RECOMP_TLS uint32_t g_ebp;
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi;
+/* x87 control and status (g_fp_control_word, g_fp_cmp, g_fp_cc): the reset
+ * default in RECOMP_REGS_INIT masks every exception and rounds to nearest,
+ * which is what the CRT expects before _control87. */
 
 /* ---- non-local jumps ---------------------------------------------------
  *
@@ -1639,23 +1652,17 @@ void xbox_WatchdogStart(void)
         CloseHandle(h);
 }
 
-/* SSE. 128 bits of architectural state, per-thread like the rest. */
-RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
-RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
-RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
-RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
-/* Last frame established by `mov ebp, esp`. Read by frameless functions
- * that address their caller's frame through ebp. */
-RECOMP_TLS uint32_t g_ebp = 0;
+/* g_mm0..7, g_xmm0..7: MMX and SSE, per-thread like the rest.
+ * g_ebp: the last frame established by `mov ebp, esp`. Read by frameless
+ * functions that address their caller's frame through ebp. */
 
-/* EFLAGS.DF. Zero means the string instructions walk forwards, which is the
+/* g_df: EFLAGS.DF. Zero means the string instructions walk forwards, which is the
  * ABI's resting state and what almost every one of them does -- so this is
  * almost always 0 and costs a predictable branch. The exceptions are the ones
  * that matter: MSVC's strrchr/wcsrchr scan backwards from the terminator with
  * `std; repne scasb`, and memmove goes backwards when its regions overlap the
  * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
  * in different lifted bodies of the same guest routine. */
-RECOMP_TLS int g_df = 0;
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};

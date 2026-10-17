@@ -232,6 +232,16 @@ that were wrong everywhere: the heap allocators had no lock, and the MMIO trap
 decoders knew only MOV, while GCC/Clang fuse a volatile `|=` into `or [mem], imm`
 (`platform/mmio_decode.h` now handles the RMW forms).
 
+**Guest registers are one block (Oct 2026):** the thread-locals the lifted code
+shares with the runtime are fields of `RecompGuestRegs g_regs` (`g_eax` is a
+macro for `RECOMP_REGS.r_eax`), declared identically in
+`templates/runtime/recomp_types.h` and `src/kernel/xbox_memory_layout.h`. A
+Windows DLL cannot import an executable's `__declspec(thread)` data, so with
+`XBOXRECOMP_REGS_IN_MODULE` the game module owns the block and the runtime
+reaches it through a per-thread pointer; otherwise the executable owns it.
+Generated code is unchanged and smaller (one TLS offset per function). Never
+declare a register yourself: include one of the two headers.
+
 The A/B problem is solved: **frame capture and replay** (`src/hle/d3d8_capture.h`,
 `src/replay`) records one frame's host calls and plays them back with no game running, so
 one frame can be drawn by two backends and compared. That is the bring-up loop for a Vulkan

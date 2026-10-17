@@ -15,6 +15,8 @@
 
 #include <sys/stat.h>
 
+#include "xbox_memory_layout.h"   /* RecompGuestRegs, recomp_regs_attach */
+
 #if defined(_WIN32)
 #  include <windows.h>
 #  define MODULE_OPEN(p)      ((void *)LoadLibraryA(p))
@@ -129,6 +131,35 @@ int recomp_module_load(const char *path, const char *default_name,
                  (unsigned)RECOMP_MODULE_ABI);
         g_module = NULL;
         return 0;
+    }
+
+    /* The register block: the same layout on both sides, and owned by the
+     * side this runtime expects. A module that owns it while the runtime
+     * keeps one too (or neither) would run with two sets of registers. */
+    {
+        const uint32_t *layout = (const uint32_t *)MODULE_SYM(g_module,
+                                                    "recomp_module_regs_layout");
+        RecompGuestRegs *(*module_regs)(void) =
+            (RecompGuestRegs *(*)(void))MODULE_SYM(g_module, "recomp_module_regs");
+#ifdef RECOMP_REGS_IN_MODULE
+        const int want_regs = 1;
+#else
+        const int want_regs = 0;
+#endif
+        if (!layout || *layout != RECOMP_REGS_LAYOUT || !module_regs != !want_regs) {
+            snprintf(err, err_bytes,
+                     "The game module\n%s\nwas built for a different version of "
+                     "the runtime (%s). Rebuild it.", g_module_path,
+                     !layout || *layout != RECOMP_REGS_LAYOUT
+                         ? "the guest register layout differs"
+                         : want_regs ? "the runtime expects the module to own the registers"
+                                     : "the module owns the registers, the runtime keeps them");
+            g_module = NULL;
+            return 0;
+        }
+#ifdef RECOMP_REGS_IN_MODULE
+        recomp_regs_attach(module_regs);
+#endif
     }
 
     g_entry         = (void (*)(void))MODULE_SYM(g_module, "xbe_entry_point");

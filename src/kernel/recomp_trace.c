@@ -20,13 +20,10 @@
 
 #include "xbox_memory_layout.h"
 
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 /* The frame pointers. Lifted functions keep ebp in a local and publish it
  * here before every call, so at a throw or a fault these still name the frame
  * of whoever is running -- which is what makes a watchpoint on one of its
  * locals possible. */
-extern RECOMP_TLS uint32_t g_ebp, g_seh_ebp;
 
 /* A run that recurses produces trace lines without limit, and the useful
  * window is rarely the first few thousand. The budget stops a diagnostic from

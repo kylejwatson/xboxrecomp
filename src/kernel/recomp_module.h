@@ -12,8 +12,12 @@
  * Direction of the links:
  *   module -> runtime  ordinary imports: the executable exports its symbols
  *                      (ENABLE_EXPORTS), including the thread-local guest
- *                      registers, which the module reads with the
- *                      initial-exec TLS model.
+ *                      register block g_regs, which the module reads with
+ *                      the initial-exec TLS model -- unless the module owns
+ *                      the block (RECOMP_REGS_IN_MODULE, needed on Windows,
+ *                      where a DLL cannot import thread-local data): then
+ *                      the runtime asks it for this thread's block with
+ *                      `recomp_module_regs` (xbox_memory_layout.h).
  *   runtime -> module  by name, here: recomp_lookup, recomp_lookup_manual,
  *                      the entry point, and every HLE_IMPORT_VAR /
  *                      HLE_ORIGINAL slot (hle.h), filled in by
@@ -34,7 +38,22 @@ extern "C" {
 /* Bumped whenever what the runtime expects of a module changes. A module
  * exports `recomp_module_abi` (src/kernel/recomp_module_abi.c, compiled into
  * the module) and a mismatch is refused at load. */
-#define RECOMP_MODULE_ABI 1
+#define RECOMP_MODULE_ABI 2   /* 2: the registers are one block, g_regs */
+
+/* The register block's layout (RecompGuestRegs: xbox_memory_layout.h and
+ * templates/runtime/recomp_types.h each keep a copy) folded into a number.
+ * The module exports its value as the lifted code sees the block
+ * (`recomp_module_regs_layout`) and the runtime compares it with its own,
+ * so the two copies cannot drift apart unnoticed. Needs whichever header
+ * defines the block. */
+#define RECOMP_REGS_LAYOUT ((uint32_t)( \
+    sizeof(RecompGuestRegs) * 1000003u + \
+    offsetof(RecompGuestRegs, r_esp) * 7u + offsetof(RecompGuestRegs, r_ebp) * 11u + \
+    offsetof(RecompGuestRegs, r_fs_base) * 13u + offsetof(RecompGuestRegs, r_icall_dispatch_form) * 17u + \
+    offsetof(RecompGuestRegs, r_df) * 19u + offsetof(RecompGuestRegs, r_fp_cmp) * 23u + \
+    offsetof(RecompGuestRegs, r_fp_cc) * 29u + offsetof(RecompGuestRegs, r_fp_stack) * 31u + \
+    offsetof(RecompGuestRegs, r_mm0) * 37u + offsetof(RecompGuestRegs, r_xmm0) * 41u + \
+    offsetof(RecompGuestRegs, r_xmm7) * 43u))
 
 /* A slot in the runtime that takes a value from the module. hle.h declares
  * one per HLE_IMPORT_VAR / HLE_ORIGINAL in module-host builds and registers it

@@ -48,15 +48,34 @@ endif()
 # The lifted game as a module the runtime loads at run time
 # (src/kernel/recomp_module.h): the executable then holds no game code and can
 # be shared, and the module is built from the player's own disc. Builds the
-# runtime libraries with RECOMP_MODULE_HOST. Not on Windows yet: the module
-# reads the guest registers, which are thread-locals of the executable, and a
-# DLL cannot import a __declspec(thread) variable.
+# runtime libraries with RECOMP_MODULE_HOST.
+#
+# XBOXRECOMP_REGS_IN_MODULE: the module, not the executable, owns the guest
+# register block (xbox_memory_layout.h). Windows needs it -- a DLL cannot
+# import an executable's __declspec(thread) data -- and it works on Linux too
+# (the block then sits in the module's static TLS); Linux keeps the block in
+# the executable by default, its proven arrangement. The title's module and
+# executable need RECOMP_REGS_IN_MODULE as well (see its CMakeLists).
+#
+# Not on Windows yet: the register block is ready for it, but the module
+# build itself (the title's module target, the executable's import library,
+# the first-run window) has not been ported.
 option(XBOXRECOMP_GAME_MODULE "Load the lifted game as a shared module" OFF)
+if(WIN32)
+    set(_regs_in_module_default ON)
+else()
+    set(_regs_in_module_default OFF)
+endif()
+option(XBOXRECOMP_REGS_IN_MODULE "The game module owns the guest registers"
+       ${_regs_in_module_default})
 if(XBOXRECOMP_GAME_MODULE)
     if(WIN32)
         message(FATAL_ERROR "XBOXRECOMP_GAME_MODULE is not supported on Windows yet")
     endif()
     add_compile_definitions(RECOMP_MODULE_HOST)
+    if(XBOXRECOMP_REGS_IN_MODULE)
+        add_compile_definitions(RECOMP_REGS_IN_MODULE)
+    endif()
 endif()
 
 # Option to build examples

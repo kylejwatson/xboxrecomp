@@ -58,9 +58,10 @@ class RuntimeHelpersDefinedTest(unittest.TestCase):
         for i in range(8):
             self.assertIn(f"#define xmm{i} g_xmm{i}", runtime)
         self.assertIn("typedef union RecompXmm", runtime)
-        main_c = (_ROOT / "templates" / "new-game" / "src" / "main.c").read_text(
-            encoding="utf-8")
-        self.assertIn("RecompXmm g_xmm0", main_c)
+        # The storage is the register block's (one per thread).
+        for i in range(8):
+            self.assertIn(f"#define g_xmm{i} (RECOMP_REGS.r_xmm{i})", runtime)
+        self.assertIn("RecompXmm r_xmm0", runtime)
 
 
 if __name__ == "__main__":

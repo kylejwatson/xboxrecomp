@@ -168,13 +168,98 @@ extern uint32_t g_xbox_code_hi;
 #  define RECOMP_TLS _Thread_local
 #endif
 
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+/* The register state lives in one per-thread block, and g_eax and the rest
+ * name its fields. One object rather than 34 can be handed across a module
+ * boundary: a Windows DLL cannot import an executable's thread-local
+ * variables, so when the game is a module there the module owns the block
+ * and the runtime reaches it through a pointer (RECOMP_REGS_IN_MODULE in
+ * src/kernel/xbox_memory_layout.h). The lifted code always names the block
+ * directly, so an access costs what a separate thread-local did. A field is
+ * the register's name with r_ for g_ (r_eax), so designated initialisers and
+ * offsetof can name it past the macros.
+ *
+ * The MMX/SSE unions are here because the block holds them; their sections
+ * below say how they are used. Everything in this block has an identical
+ * copy in src/kernel/xbox_memory_layout.h, and the guards let a file include
+ * both. recomp_module_load compares the two layouts. */
+#ifndef RECOMP_MMX_DEFINED
+#define RECOMP_MMX_DEFINED
+typedef union RecompMmx {
+    int8_t   b[8];
+    uint8_t  ub[8];
+    int16_t  w[4];
+    uint16_t uw[4];
+    int32_t  d[2];
+    uint32_t ud[2];
+    uint64_t q;
+} RecompMmx;
+#endif
+
+#ifndef RECOMP_XMM_DEFINED
+#define RECOMP_XMM_DEFINED
+typedef union RecompXmm {
+    float    f[4];
+    double   d[2];
+    uint32_t u[4];
+    int32_t  i[4];
+    uint64_t q[2];
+} RecompXmm;
+#endif
+
+#ifndef RECOMP_GUEST_REGS_DEFINED
+#define RECOMP_GUEST_REGS_DEFINED
+typedef struct RecompGuestRegs {
+    uint32_t  r_eax, r_ecx, r_edx, r_esp, r_ebx, r_esi, r_edi, r_ebp;
+    uint32_t  r_seh_ebp, r_fs_base;
+    uint32_t  r_icall_saved_esp, r_icall_dispatch_form;
+    int       r_df, r_fp_top, r_fp_cmp;
+    uint16_t  r_fp_control_word, r_fp_cc;
+    double    r_fp_stack[8];
+    RecompMmx r_mm0, r_mm1, r_mm2, r_mm3, r_mm4, r_mm5, r_mm6, r_mm7;
+    RecompXmm r_xmm0, r_xmm1, r_xmm2, r_xmm3, r_xmm4, r_xmm5, r_xmm6, r_xmm7;
+} RecompGuestRegs;
+
+extern RECOMP_TLS RecompGuestRegs g_regs;
+#define RECOMP_REGS g_regs
+#define g_eax (RECOMP_REGS.r_eax)
+#define g_ecx (RECOMP_REGS.r_ecx)
+#define g_edx (RECOMP_REGS.r_edx)
+#define g_esp (RECOMP_REGS.r_esp)
+#define g_ebx (RECOMP_REGS.r_ebx)
+#define g_esi (RECOMP_REGS.r_esi)
+#define g_edi (RECOMP_REGS.r_edi)
+#define g_ebp (RECOMP_REGS.r_ebp)
+#define g_seh_ebp (RECOMP_REGS.r_seh_ebp)
+#define g_fs_base (RECOMP_REGS.r_fs_base)
+#define g_icall_saved_esp (RECOMP_REGS.r_icall_saved_esp)
+#define g_icall_dispatch_form (RECOMP_REGS.r_icall_dispatch_form)
+#define g_df (RECOMP_REGS.r_df)
+#define g_fp_top (RECOMP_REGS.r_fp_top)
+#define g_fp_cmp (RECOMP_REGS.r_fp_cmp)
+#define g_fp_control_word (RECOMP_REGS.r_fp_control_word)
+#define g_fp_cc (RECOMP_REGS.r_fp_cc)
+#define g_fp_stack (RECOMP_REGS.r_fp_stack)
+#define g_mm0 (RECOMP_REGS.r_mm0)
+#define g_mm1 (RECOMP_REGS.r_mm1)
+#define g_mm2 (RECOMP_REGS.r_mm2)
+#define g_mm3 (RECOMP_REGS.r_mm3)
+#define g_mm4 (RECOMP_REGS.r_mm4)
+#define g_mm5 (RECOMP_REGS.r_mm5)
+#define g_mm6 (RECOMP_REGS.r_mm6)
+#define g_mm7 (RECOMP_REGS.r_mm7)
+#define g_xmm0 (RECOMP_REGS.r_xmm0)
+#define g_xmm1 (RECOMP_REGS.r_xmm1)
+#define g_xmm2 (RECOMP_REGS.r_xmm2)
+#define g_xmm3 (RECOMP_REGS.r_xmm3)
+#define g_xmm4 (RECOMP_REGS.r_xmm4)
+#define g_xmm5 (RECOMP_REGS.r_xmm5)
+#define g_xmm6 (RECOMP_REGS.r_xmm6)
+#define g_xmm7 (RECOMP_REGS.r_xmm7)
+#endif
+
 
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS int g_fp_top;
 
 /**
  * SEH frame pointer bridge.
@@ -192,10 +277,8 @@ extern RECOMP_TLS int g_fp_top;
  * Per-thread, because a TIB is. fs:[0] is the SEH chain head and fs:[4]
  * reaches the CRT's per-thread data, so a single shared base makes every
  * guest thread the same thread as far as the CRT is concerned. */
-extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE g_fs_base
 
-extern RECOMP_TLS uint32_t g_seh_ebp;
 
 /* ---- non-local jumps (setjmp / longjmp) --------------------------------
  *
@@ -237,7 +320,6 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
-extern RECOMP_TLS uint32_t g_ebp;
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
  *
@@ -251,16 +333,12 @@ extern RECOMP_TLS uint32_t g_ebp;
  * be found by name, and the dashboard rebooted rather than showing a UI.
  * memmove's overlapping case is the same instruction and the same bug.
  */
-extern RECOMP_TLS int g_df;
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
-extern RECOMP_TLS uint16_t g_fp_control_word;
-extern RECOMP_TLS int g_fp_cmp;
-extern RECOMP_TLS uint16_t g_fp_cc;
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
 /* Values in the existing double-backed stack are all representable as normal
  * x87 extended values, including binary64 subnormals. Empty stack tags and
@@ -338,7 +416,6 @@ extern volatile uint64_t g_icall_count;
  * RECOMP_ICALL_SAFE, and the current frame's own for RECOMP_ITAIL, which
  * pushes nothing. Set here rather than passed, so a title whose generated
  * header predates this still compiles and simply reports no callers. */
-extern RECOMP_TLS uint32_t g_icall_saved_esp;
 /* Which dispatch form was refused: 0 unknown, 1 call, 2 jump.
  *
  * The two mean different things and want different next steps. A call to
@@ -351,7 +428,6 @@ extern RECOMP_TLS uint32_t g_icall_saved_esp;
  * predates this never assigns it, and a two-valued flag would then read
  * as "call" for every refusal including the jumps -- the exact wrong
  * answer this exists to stop giving. Unknown is reported as unknown. */
-extern RECOMP_TLS uint32_t g_icall_dispatch_form;
 
 void recomp_icall_fail_log(uint32_t va);
 
@@ -461,19 +537,7 @@ void recomp_trace_esp(const char *name, const char *tag);
  * being the unordered form) and the header stays portable.
  * ================================================================ */
 
-#ifndef RECOMP_XMM_DEFINED
-#define RECOMP_XMM_DEFINED
-typedef union RecompXmm {
-    float    f[4];
-    double   d[2];
-    uint32_t u[4];
-    int32_t  i[4];
-    uint64_t q[2];
-} RecompXmm;
-#endif
-
-extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
-extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+/* RecompXmm is defined with the register block, above. */
 
 /* -- construction -- */
 
@@ -1163,21 +1227,7 @@ extern volatile uint64_t g_icall_guard_misses;
  * hardware exists to let software avoid.
  * ================================================================ */
 
-#ifndef RECOMP_MMX_DEFINED
-#define RECOMP_MMX_DEFINED
-typedef union RecompMmx {
-    int8_t   b[8];
-    uint8_t  ub[8];
-    int16_t  w[4];
-    uint16_t uw[4];
-    int32_t  d[2];
-    uint32_t ud[2];
-    uint64_t q;
-} RecompMmx;
-#endif
-
-extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
-extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
+/* RecompMmx is defined with the register block, above. */
 
 static inline RecompMmx MMX_ZERO(void) { RecompMmx r; r.q = 0; return r; }
 

@@ -61,8 +61,6 @@
 #include <dbghelp.h>
 #endif
 
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
 

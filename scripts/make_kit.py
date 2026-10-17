@@ -151,6 +151,9 @@ def main():
                     help="Another XBE the kit accepts (it must lift to the "
                          "same code)")
     ap.add_argument("--zig", help="A Zig distribution directory to include")
+    ap.add_argument("--define", action="append", default=[],
+                    help="A preprocessor define the module is built with, as "
+                         "the title's build has it (e.g. RECOMP_REGS_IN_MODULE)")
     ap.add_argument("--cc", default=os.environ.get("CC", "cc"),
                     help="Compiler used to find the headers the module needs")
     ap.add_argument("--no-verify", action="store_true",
@@ -243,7 +246,7 @@ def main():
     includes = [project / "src", project / "src/recomp"]
     includes += [REPO / d for d in TOOLKIT_INCLUDES]
     sources = [manual] + sorted(gen.glob("*.c")) + [REPO / s for s in MODULE_SOURCES]
-    defines = ["_GNU_SOURCE", "NOMINMAX", "WIN32_LEAN_AND_MEAN"]
+    defines = ["_GNU_SOURCE", "NOMINMAX", "WIN32_LEAN_AND_MEAN"] + args.define
     headers = header_closure(args.cc, sources, includes + [gen], defines)
     for h in sorted(headers):
         if h.is_relative_to(gen):
