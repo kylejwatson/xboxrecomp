@@ -45,6 +45,14 @@ else()
     add_compile_options(-Werror=implicit-function-declaration)
 endif()
 
+# No errno from the math functions (nothing here reads it), so sqrtf and
+# friends become instructions instead of libm calls. Beyond speed, glibc 2.43
+# versioned sqrtf anew, and one call from a build on a new system was enough
+# to make the shared runtime refuse to start on any older one.
+if(NOT MSVC)
+    add_compile_options(-fno-math-errno)
+endif()
+
 # The lifted game as a module the runtime loads at run time
 # (src/kernel/recomp_module.h): the executable then holds no game code and can
 # be shared, and the module is built from the player's own disc. Builds the

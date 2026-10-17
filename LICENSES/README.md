@@ -10,3 +10,10 @@ and remaining the copyright of espes, Jannik Vogel and Matt Borgerson.
 
 Shipping the verbatim text alongside those files is an LGPL requirement, not
 a courtesy.
+
+`Apache-2.0.txt` (the SPDX text of the Apache License 2.0) and
+`glslang-LICENSE.txt` (glslang's own LICENSE.txt, as its distribution packages
+install it) are for the shareable Linux build, which carries shaderc,
+SPIRV-Tools (both Apache-2.0) and glslang beside the runtime because few
+distributions install them; the title's make_kit.sh copies them into the
+build's LICENSES/ with an index (THIRD_PARTY.txt).

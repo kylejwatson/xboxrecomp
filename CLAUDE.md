@@ -242,6 +242,15 @@ reaches it through a per-thread pointer; otherwise the executable owns it.
 Generated code is unchanged and smaller (one TLS offset per function). Never
 declare a register yourself: include one of the two headers.
 
+**Title kits ship their own tools (Oct 2026):** `scripts/make_kit.py --python
+<dir>` puts a relocatable Python with capstone in the kit
+(`scripts/fetch_python.py`, pinned by SHA-256; the capstone version decides the
+reference lift, so change it only with a new reference), `--zig` a Zig
+(`fetch_zig.py`). `--record-inputs DIR` writes what a kit takes from the disc
+(XBE hash, title id, generated-file digests, XDK symbols); `--inputs DIR` makes
+the kit from that alone, with no disc and no lift, which is how CI builds one.
+The kit id ignores `made_from`, so both ways give the same id.
+
 The A/B problem is solved: **frame capture and replay** (`src/hle/d3d8_capture.h`,
 `src/replay`) records one frame's host calls and plays them back with no game running, so
 one frame can be drawn by two backends and compared. That is the bring-up loop for a Vulkan

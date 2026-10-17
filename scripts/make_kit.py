@@ -10,7 +10,8 @@ produces it. A kit is that recipe:
 
     kit.json            what to lift and how to compile it, the XBE it is for
                         (SHA-256), the digest of the reference lift, and the
-                        kit id (a digest of everything below but zig/)
+                        kit id (a digest of everything below but zig/ and
+                        python/, whose versions it records)
     kit.id              the kit id alone, for the runtime: it names the
                         directory the module is built into
     reference.json      SHA-256 of every generated file of the reference lift
@@ -22,6 +23,11 @@ produces it. A kit is that recipe:
                         recomp_manual.c and the headers that includes
     zig/                optional (--zig): a Zig distribution, the C compiler
                         scripts/build_module.py uses when it is there
+    python/             optional (--python): a relocatable Python with capstone
+                        (scripts/fetch_python.py), which the runtime runs
+                        build_module.py with, so the player needs no Python.
+                        Run make_kit.py with that same interpreter: the check
+                        that the lift reproduces the reference then uses it.
 
 scripts/build_module.py, run from the kit, does the rest on the player's
 machine. The XDK symbols file is a list of names and addresses inside the
@@ -36,6 +42,15 @@ The reference lift is the project's src/recomp/gen as it is now: lift first,
 then make the kit, so the two agree. The kit is refused when the generated
 code was not lifted from this XBE or with these seeds (checked by lifting
 again unless --no-verify).
+
+Without the disc (a CI runner): what the kit takes from the XBE and the lift
+-- the XBE's SHA-256 and title ID, the digest of every generated file, the
+XDK symbol addresses -- is facts about the disc, not bytes of it, and
+--record-inputs DIR writes it down whenever a kit is made with the disc.
+--inputs DIR (instead of --xbe) makes the same kit from those files alone:
+nothing is lifted or verified, and the headers the module needs are found
+from recomp_manual.c and the toolkit sources (the generated code includes
+nothing outside src/recomp/gen).
 """
 
 import argparse
@@ -119,9 +134,11 @@ def lifter_file(rel):
     return True
 
 
-def header_closure(cc, sources, include_dirs, defines):
-    """Every header outside the system ones the sources include, by path."""
-    argv = [cc, "-MM", "-std=gnu11", "-w"]
+def header_closure(cc, sources, include_dirs, defines, generated_missing=False):
+    """Every header outside the system ones the sources include, by path.
+    generated_missing: the generated headers are not there (no lift); they
+    are left out, and they include nothing that is not generated."""
+    argv = [cc, "-MM", "-std=gnu11", "-w"] + (["-MG"] if generated_missing else [])
     argv += ["-D" + d for d in defines]
     argv += ["-I" + str(d) for d in include_dirs]
     found = set()
@@ -130,7 +147,8 @@ def header_closure(cc, sources, include_dirs, defines):
         if out.returncode != 0:
             raise SystemExit(f"{cc} -MM failed on {src}:\n{out.stderr}")
         for tok in out.stdout.replace("\\\n", " ").split()[1:]:
-            if tok.endswith(".h"):
+            if tok.endswith(".h") and (not generated_missing or "/" in tok
+                                       and Path(tok).exists()):
                 found.add(Path(tok).resolve())
     return found
 
@@ -139,7 +157,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--project", required=True, help="The title project")
-    ap.add_argument("--xbe", required=True, help="The XBE the reference lift is of")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--xbe", help="The XBE the reference lift is of")
+    src.add_argument("--inputs", help="A --record-inputs directory, instead of the "
+                                      "XBE and the lift (no disc needed)")
+    ap.add_argument("--record-inputs", help="Write what the kit takes from the disc "
+                                            "and the lift into this directory")
     ap.add_argument("--module-name", required=True,
                     help="Module file name without extension (the name the "
                          "title's main.c loads)")
@@ -151,6 +174,8 @@ def main():
                     help="Another XBE the kit accepts (it must lift to the "
                          "same code)")
     ap.add_argument("--zig", help="A Zig distribution directory to include")
+    ap.add_argument("--python", help="A fetch_python.py directory (holding python/) "
+                                     "to include")
     ap.add_argument("--define", action="append", default=[],
                     help="A preprocessor define the module is built with, as "
                          "the title's build has it (e.g. RECOMP_REGS_IN_MODULE)")
@@ -162,22 +187,35 @@ def main():
     args = ap.parse_args()
 
     project = Path(args.project).resolve()
-    xbe = Path(args.xbe).resolve()
     gen = project / "src" / "recomp" / "gen"
     manual = project / "src" / "recomp_manual.c"
-    hle_symbols = (Path(args.hle_symbols) if args.hle_symbols
-                   else xbe.with_name(xbe.stem + "_xdk_symbols.json")).resolve()
     out = Path(args.out).resolve()
-    for need in (xbe, gen, manual, hle_symbols):
+    if args.inputs:
+        inputs = Path(args.inputs).resolve()
+        hle_symbols = inputs / "xdk_symbols.json"
+        recorded = json.loads((inputs / "inputs.json").read_text())
+        needs = (manual, hle_symbols)
+    else:
+        xbe = Path(args.xbe).resolve()
+        hle_symbols = (Path(args.hle_symbols) if args.hle_symbols
+                       else xbe.with_name(xbe.stem + "_xdk_symbols.json")).resolve()
+        needs = (xbe, gen, manual, hle_symbols)
+    for need in needs:
         if not need.exists():
             raise SystemExit(f"missing: {need}")
     if out.exists() and any(out.iterdir()):
         raise SystemExit(f"{out} exists and is not empty")
 
-    manifest = gen_manifest(gen)
+    if args.inputs:
+        manifest = recorded["reference"]
+        xbe_sha, title_id = recorded["xbe_sha256"], recorded["title_id"]
+        print(f"from recorded inputs ({inputs}): the reference is not checked")
+    else:
+        manifest = gen_manifest(gen)
+        xbe_sha, title_id = sha256_file(xbe), xbe_title_id(xbe)
     digest = manifest_digest(manifest)
 
-    if not args.no_verify:
+    if not args.no_verify and not args.inputs:
         # Lift again from scratch with exactly what goes into the kit, and
         # insist on the same result: a reference that the kit's own inputs do
         # not reproduce would fail every player's build.
@@ -245,9 +283,12 @@ def main():
     # relative to the toolkit or the project.
     includes = [project / "src", project / "src/recomp"]
     includes += [REPO / d for d in TOOLKIT_INCLUDES]
-    sources = [manual] + sorted(gen.glob("*.c")) + [REPO / s for s in MODULE_SOURCES]
+    sources = [manual] + [REPO / s for s in MODULE_SOURCES]
+    if not args.inputs:
+        sources += sorted(gen.glob("*.c"))
     defines = ["_GNU_SOURCE", "NOMINMAX", "WIN32_LEAN_AND_MEAN"] + args.define
-    headers = header_closure(args.cc, sources, includes + [gen], defines)
+    headers = header_closure(args.cc, sources, includes + [gen], defines,
+                             generated_missing=bool(args.inputs))
     for h in sorted(headers):
         if h.is_relative_to(gen):
             continue                    # generated: comes from the player's lift
@@ -264,11 +305,17 @@ def main():
     if args.zig:
         print("copying Zig...")
         shutil.copytree(Path(args.zig).resolve(), out / "zig", symlinks=True)
+    if args.python:
+        print("copying Python...")
+        # Without bytecode caches: running the source Python leaves them, and
+        # they would differ from one kit to the next.
+        shutil.copytree(Path(args.python).resolve() / "python", out / "python",
+                        symlinks=True,
+                        ignore=shutil.ignore_patterns("__pycache__"))
 
-    xbe_sha = sha256_file(xbe)
     kit = {
         "format": KIT_FORMAT,
-        "title_id": xbe_title_id(xbe),
+        "title_id": title_id,
         "game_name": args.game_name,
         "module_name": args.module_name,
         "module_abi": module_abi(),
@@ -295,13 +342,30 @@ def main():
         zig = out / "zig" / ("zig.exe" if (out / "zig" / "zig.exe").exists() else "zig")
         kit["zig"] = subprocess.run([str(zig), "version"], capture_output=True,
                                     text=True).stdout.strip() or None
+    if args.python:
+        py = out / "python" / ("python.exe" if (out / "python" / "python.exe").exists()
+                               else "bin/python3")
+        ver = subprocess.run([str(py), "-c", "import sys, capstone; "
+                              "print(sys.version.split()[0], capstone.__version__)"],
+                             capture_output=True, text=True).stdout.split()
+        if len(ver) != 2:
+            sys.exit(f"make_kit: {py} does not run, or has no capstone")
+        kit["python"] = {"version": ver[0], "capstone": ver[1]}
+        if kit["python"] != {"version": kit["made_from"]["python"],
+                             "capstone": kit["made_from"]["capstone"]}:
+            print(f"warning: the kit's Python ({ver[0]}, capstone {ver[1]}) is not "
+                  "the one this kit was made with, so the reference was not "
+                  "checked with it; run make_kit.py with the bundled interpreter")
     reference_text = json.dumps(manifest, indent=1) + "\n"
     (out / "reference.json").write_text(reference_text)
     # The kit id: everything that decides what the module is. A runtime that
     # carries this kit builds into a directory named after it, so a changed
     # override or seed is a new module, never a stale one reused.
+    # made_from is a note of where the kit came from, not an input: the same
+    # sources from a git checkout and from a plain copy (CI) are one kit.
     h = hashlib.sha256()
-    h.update(json.dumps(kit, sort_keys=True).encode())
+    h.update(json.dumps({k: v for k, v in kit.items() if k != "made_from"},
+                        sort_keys=True).encode())
     h.update(reference_text.encode())
     for part in ("toolkit", "title"):
         for f in sorted((out / part).rglob("*")):
@@ -311,6 +375,14 @@ def main():
     kit["kit_id"] = h.hexdigest()
     (out / "kit.json").write_text(json.dumps(kit, indent=2) + "\n")
     (out / "kit.id").write_text(kit["kit_id"] + "\n")
+    if args.record_inputs and not args.inputs:
+        rec = Path(args.record_inputs)
+        rec.mkdir(parents=True, exist_ok=True)
+        (rec / "inputs.json").write_text(json.dumps(
+            {"xbe_sha256": xbe_sha, "title_id": title_id, "reference": manifest},
+            indent=1, sort_keys=True) + "\n")
+        shutil.copy2(title / "xdk_symbols.json", rec / "xdk_symbols.json")
+        print(f"recorded the disc's facts in {rec}")
 
     size = sum(p.stat().st_size for p in out.rglob("*") if p.is_file())
     print(f"kit written to {out} ({size / 1e6:.1f} MB, reference {digest[:16]}, "
