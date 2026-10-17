@@ -45,6 +45,20 @@ else()
     add_compile_options(-Werror=implicit-function-declaration)
 endif()
 
+# The lifted game as a module the runtime loads at run time
+# (src/kernel/recomp_module.h): the executable then holds no game code and can
+# be shared, and the module is built from the player's own disc. Builds the
+# runtime libraries with RECOMP_MODULE_HOST. Not on Windows yet: the module
+# reads the guest registers, which are thread-locals of the executable, and a
+# DLL cannot import a __declspec(thread) variable.
+option(XBOXRECOMP_GAME_MODULE "Load the lifted game as a shared module" OFF)
+if(XBOXRECOMP_GAME_MODULE)
+    if(WIN32)
+        message(FATAL_ERROR "XBOXRECOMP_GAME_MODULE is not supported on Windows yet")
+    endif()
+    add_compile_definitions(RECOMP_MODULE_HOST)
+endif()
+
 # Option to build examples
 
 # ── Runtime Libraries ─────────────────────────────────────────

@@ -43,14 +43,46 @@ extern ptrdiff_t g_xbox_mem_offset;
  * start a line, like HLE_EXPORT: tools.recomp scans for the marker and writes
  * the definition into recomp_hle.c from the title's XDK symbols. 0 means the
  * symbols could not name it, so check before use. */
+#ifndef RECOMP_MODULE_HOST
 #define HLE_IMPORT_VAR(name) extern const uint32_t hle_var_##name
+#endif
 
 /* Declares the original, lifted body of a replaced function as
  * hle_original_<name>, for a replacement that runs the title's own code and
  * then does its own work. Must start a line, like HLE_EXPORT: tools.recomp
  * scans for it, keeps the body as sub_XXXXXXXX_hle_original, and defines the
  * pointer in recomp_hle.c -- 0 when this title does not replace the function. */
+#ifndef RECOMP_MODULE_HOST
 #define HLE_ORIGINAL(name) extern void (*const hle_original_##name)(void)
+#else
+/* The lifted code is a module loaded at run time (src/kernel/recomp_module.h),
+ * so the executable cannot link against the definitions in its recomp_hle.c.
+ * Each marker declares a slot in this file instead and registers it before
+ * main; recomp_module_load fills it from the module's symbol of the same
+ * name. Same spelling and the same 0-means-absent at every use. */
+#include "../kernel/recomp_module.h"
+
+#if defined(_MSC_VER)
+#  pragma section(".CRT$XCU", read)
+#  define HLE_SLOT_CTOR(fn)                                                  \
+    static void fn(void);                                                    \
+    __declspec(allocate(".CRT$XCU")) static void (*fn##_ptr)(void) = fn;     \
+    static void fn(void)
+#else
+#  define HLE_SLOT_CTOR(fn) __attribute__((constructor)) static void fn(void)
+#endif
+
+#define HLE_MODULE_SLOT(sym, decl, is_fn)                                     \
+    static decl;                                                             \
+    static RecompModuleSlot hle_slot_##sym = { #sym, is_fn, &sym, 0 };       \
+    HLE_SLOT_CTOR(hle_slot_reg_##sym) { recomp_module_register_slot(&hle_slot_##sym); } \
+    typedef int hle_slot_semicolon_##sym
+
+#define HLE_IMPORT_VAR(name)                                                  \
+    HLE_MODULE_SLOT(hle_var_##name, uint32_t hle_var_##name, 0)
+#define HLE_ORIGINAL(name)                                                    \
+    HLE_MODULE_SLOT(hle_original_##name, void (*hle_original_##name)(void), 1)
+#endif
 
 /* Run the original body with the guest stack exactly as the caller left it.
  * The body pops its own return address and arguments, as its `ret N` does;

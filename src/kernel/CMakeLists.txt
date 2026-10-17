@@ -25,6 +25,7 @@ set(KERNEL_SOURCES
     exit_trace.c
     recomp_trace.c
     recomp_fps.c
+    recomp_module.c
     recomp_sample.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
