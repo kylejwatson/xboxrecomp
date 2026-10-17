@@ -40,8 +40,10 @@ static inline void xbox_path_normalize(char *p)
 #endif
 }
 
-/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX. */
-#if !defined(_MSC_VER)
+/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX. MinGW
+ * (the kit's Zig on Windows) has a real one, which <windows.h> below
+ * declares: a macro defined first breaks that declaration. */
+#if !defined(_MSC_VER) && !defined(_WIN32)
 #define __debugbreak() __builtin_trap()
 #endif
 
