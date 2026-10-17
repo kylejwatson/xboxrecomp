@@ -1408,10 +1408,19 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
             D3D11_DEPTH_STENCIL_VIEW_DESC dsvd;
             memset(&dsvd, 0, sizeof(dsvd));
             dsvd.Format = dxgi;
-            dsvd.ViewDimension = is_array
-                ? D3D11_DSV_DIMENSION_TEXTURE2DARRAY
-                : D3D11_DSV_DIMENSION_TEXTURE2D;
-            if (is_array) {
+            /* A multisampled texture needs an MS view: D3D11 refuses a
+             * TEXTURE2D one (the Vulkan backend did not check). */
+            dsvd.ViewDimension = sf->sample_count > 1
+                ? (is_array ? D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY
+                            : D3D11_DSV_DIMENSION_TEXTURE2DMS)
+                : is_array ? D3D11_DSV_DIMENSION_TEXTURE2DARRAY
+                           : D3D11_DSV_DIMENSION_TEXTURE2D;
+            if (sf->sample_count > 1) {
+                if (is_array) {
+                    dsvd.Texture2DMSArray.FirstArraySlice = array_slice;
+                    dsvd.Texture2DMSArray.ArraySize = 1;
+                }
+            } else if (is_array) {
                 dsvd.Texture2DArray.MipSlice = mip_slice;
                 dsvd.Texture2DArray.FirstArraySlice = array_slice;
                 dsvd.Texture2DArray.ArraySize = 1;
@@ -1425,10 +1434,17 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
         D3D11_RENDER_TARGET_VIEW_DESC rtvd;
         memset(&rtvd, 0, sizeof(rtvd));
         rtvd.Format = dxgi;
-        rtvd.ViewDimension = is_array
-            ? D3D11_RTV_DIMENSION_TEXTURE2DARRAY
-            : D3D11_RTV_DIMENSION_TEXTURE2D;
-        if (is_array) {
+        rtvd.ViewDimension = sf->sample_count > 1
+            ? (is_array ? D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY
+                        : D3D11_RTV_DIMENSION_TEXTURE2DMS)
+            : is_array ? D3D11_RTV_DIMENSION_TEXTURE2DARRAY
+                       : D3D11_RTV_DIMENSION_TEXTURE2D;
+        if (sf->sample_count > 1) {
+            if (is_array) {
+                rtvd.Texture2DMSArray.FirstArraySlice = array_slice;
+                rtvd.Texture2DMSArray.ArraySize = 1;
+            }
+        } else if (is_array) {
             rtvd.Texture2DArray.MipSlice = mip_slice;
             rtvd.Texture2DArray.FirstArraySlice = array_slice;
             rtvd.Texture2DArray.ArraySize = 1;

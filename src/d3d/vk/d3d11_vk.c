@@ -1867,7 +1867,8 @@ HRESULT vk11_dev_CreateRenderTargetView(ID3D11Device *dev, ID3D11Resource *res,
     else if (d && d->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY) {
         mip = d->Texture2DArray.MipSlice;
         layer = d->Texture2DArray.FirstArraySlice;
-    }
+    } else if (d && d->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY)
+        layer = d->Texture2DMSArray.FirstArraySlice;
     LOCK();
     v = target_view(K_RTV, im, mip, layer);
     UNLOCK();
@@ -1892,7 +1893,8 @@ HRESULT vk11_dev_CreateDepthStencilView(ID3D11Device *dev, ID3D11Resource *res,
     else if (d && d->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY) {
         mip = d->Texture2DArray.MipSlice;
         layer = d->Texture2DArray.FirstArraySlice;
-    }
+    } else if (d && d->ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY)
+        layer = d->Texture2DMSArray.FirstArraySlice;
     LOCK();
     v = target_view(K_DSV, im, mip, layer);
     UNLOCK();
